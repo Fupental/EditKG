@@ -1,0 +1,12 @@
+# 先安装 PyTorch（根据你的CUDA版本选择，以下以CUDA 11.8为例）：
+# pip install torch --index-url https://download.pytorch.org/whl/cu118
+# 再安装 torch-scatter（必须与torch版本匹配）：
+# pip install torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+# 最后运行: pip install -r requirements.txt
+
+numpy
+scipy
+tqdm
+scikit-learn
+prettytable
+networkx

@@ -1,0 +1,13 @@
+# dataset
+data/
+
+# result
+result/
+
+# logs
+*.log
+nohup.out
+
+# python
+__pycache__/
+*.pyc

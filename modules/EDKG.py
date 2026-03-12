@@ -1,0 +1,1444 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+EDKG.py — ★ EditKG 核心模型文件 ★
+==========================================================================
+功能说明：
+    实现论文 "EditKG: Editing Knowledge Graph for Recommendation" 的完整模型。
+    
+    包含 5 个类，对应论文的各个核心模块：
+    
+    1. SelectAgent (APL, 属性净化层)
+       → 论文 Section 3.2.1, Eq.5-8
+       → 3层MLP，判断每条KG三元组对推荐任务的相关性分数
+    
+    2. Aggregator (CF聚合器)
+       → 论文 Section 3.3
+       → 基于稀疏矩阵乘法的用户-物品协同过滤聚合（类似LightGCN）
+    
+    3. GraphConv (图卷积主模块)
+       → 论文 Section 3.2-3.3 的核心实现
+       → 包含：APL属性筛选 + Gumbel-Max采样 + KG消息传递 + CF聚合 + MMD计算
+    
+    4. Recommender (推荐系统顶层模型)
+       → 论文 Section 3 的整体框架
+       → 管理嵌入层、图卷积、损失计算、评分预测
+    
+    5. KGC (知识图谱补全模型)
+       → 论文 Section 3.2.2, Eq.10-12
+       → 作为"教师"为Potential KG的APL提供知识蒸馏
+
+文件角色：
+    被 main.py 导入 Recommender 类，构建并训练整个推荐系统。
+    
+关键数据流：
+    all_embed [n_nodes, dim*3]
+    → 拆分为: user_emb[dim*3], item_cf_emb[dim], entity_kg_emb[dim], n_entity_kg_emb[dim]
+    → APL筛选KG + GNN聚合 → user_out, item_out
+    → 计算 BPR损失 + MMD损失 → PCGrad优化
+==========================================================================
+"""
+
+# ===================== 导入库说明（给初学者） =====================
+# 【什么是import？】引入别人写好的工具包，可以直接使用里面的功能
+import random                 # Python标准库：生成随机数
+import numpy as np            # NumPy：数组计算库（np是它的常用简称）
+import torch                  # ★ PyTorch ★ 深度学习框架的核心包
+                              #   提供"张量"(Tensor，即多维数组) 和自动求导功能
+                              #   张量就像numpy数组，但可以在GPU上高速计算，还能自动算梯度
+import torch.nn as nn         # nn = Neural Network，包含搭建神经网络的所有"积木"
+                              #   比如 nn.Linear（全连接层）、nn.Embedding（嵌入层）等
+import torch.nn.functional as F  # 函数式接口，提供 relu、sigmoid、normalize 等操作
+                                 #   与nn的区别：nn.ReLU()创建一个"层对象"，F.relu()直接调函数
+from torch_scatter import scatter_mean, scatter_sum, scatter_softmax
+                              # 第三方库 torch_scatter：按索引分组聚合
+                              #   scatter_sum(data, index)：按index分组求和
+                              #   例：data=[10,20,30], index=[0,1,0] → 结果=[40,20]
+                              #       index=0的元素有10和30，求和=40；index=1有20
+
+
+class SelectAgent(nn.Module):
+    """
+    APL（Attribute Purification Layer，属性净化层）
+    对应论文 Section 3.2.1, Eq.5-8
+    
+    核心思想：
+        不是所有KG中的三元组都对推荐有帮助。APL 学习一个评分函数，
+        判断每条三元组 (head, relation, tail) 对推荐任务的相关性。
+        
+    架构：
+        输入: concat([head_emb, relation_emb, tail_emb])  →  dim*3 维
+        → Linear(dim*3, 512) → ReLU
+        → Linear(512, 256) → ReLU  
+        → Linear(256, 1)  → 相关性分数 (logit)
+        
+    输出经过 Gumbel-Max 采样后变为软/硬掩码，决定保留还是丢弃该三元组。
+    
+    参数:
+        dim: 输入维度（= channel * 3，因为拼接了 head, relation, tail 的嵌入）
+        temperature: Gumbel-Softmax 温度参数（当前未直接使用）
+    """
+    # ==================== PyTorch 基础概念（初学者必读） ====================
+    #
+    # 【nn.Module 是什么？】
+    #   nn.Module 是 PyTorch 中所有神经网络的"父类"。所有自定义网络都要继承它。
+    #   继承后PyTorch就能自动管理参数、自动求梯度、把模型搬到GPU等。
+    #
+    # 【__init__ 和 forward 是什么？】
+    #   __init__(self, ...): "构造函数"，定义网络有哪些层（就像搭积木）
+    #   forward(self, x):   "前向传播"，定义数据怎么一步步流过这些层
+    #   训练时PyTorch自动根据forward的计算路径，用链式法则反向算梯度
+    #
+    # 【nn.Linear(in, out) 是什么？】
+    #   一个"全连接层"，内部做的就是矩阵乘法：
+    #       输出 = 输入 × W转置 + b
+    #   其中 W[out, in] 和 b[out] 是"可学习参数"——训练时自动更新
+    #   例: nn.Linear(384, 512)表示输入384维，输出512维
+    #       内部自动创建 W[512,384] 和 b[512]，共 384×512+512=197120 个参数
+    # ==================================================================
+    
+    def __init__(self, dim, temperature):
+        # super().__init__(): 调用父类nn.Module的构造函数
+        # 【必须写这行！】不写的话PyTorch无法跟踪这个网络的参数
+        super(SelectAgent, self).__init__()
+        
+        self.dim = dim                # 保存输入维度（本项目中 dim=channel*3=384）
+        self.temperature = temperature  # 温度参数（本类未直接用到，备用）
+        
+        # 定义三层全连接网络（MLP = Multi-Layer Perceptron，多层感知机）
+        # 【注意】定义层时只是声明"有这个层"，并不运行计算
+        #         真正的计算在下面的 forward() 中执行
+        self.select_linear_1 = nn.Linear(self.dim, 512)   # 第1层: dim维→512维（自动创建W和b）
+        self.select_linear_2 = nn.Linear(512, 256)         # 第2层: 512维→256维
+        self.select_linear_3 = nn.Linear(256, 1)           # 第3层: 256维→1维（输出一个分数）
+        # 总参数量 ≈ 384×512+512 + 512×256+256 + 256×1+1 ≈ 33万个可学习参数
+        
+    def forward(self, x, use_ln=False):
+        """
+        前向传播：数据从输入到输出的完整计算路径
+        
+        【调用方式】写 agent(x) 即可，PyTorch自动调用 agent.forward(x)
+        
+        参数:
+            x: 拼接后的三元组嵌入，形状 [num_edges, dim*3]
+               每行 = [head嵌入(128维), relation嵌入(128维), tail嵌入(128维)]
+        
+        返回:
+            每条边的相关性分数（logit），形状 [num_edges, 1]
+            分数越大 → 这条边越可能对推荐有帮助
+        """
+        # ---- 第1步 ----
+        # self.select_linear_1(x): 线性变换 x@W1.T+b1 → 形状变为 [num_edges, 512]
+        # torch.relu(): ReLU激活函数 = max(0, 值)，把负数变成0，正数保持不变
+        # 【为什么要加ReLU？】没有非线性激活，多层线性层叠加=一层线性层
+        #   加了ReLU，网络才能学习复杂的非线性关系
+        x = torch.relu(self.select_linear_1(x))    # [num_edges, 384] → [num_edges, 512]
+        
+        # ---- 第2步 ----
+        x = torch.relu(self.select_linear_2(x))    # [num_edges, 512] → [num_edges, 256]
+        
+        # ---- 第3步 ----
+        # 最后一层不加ReLU：输出需要是任意实数（正/负都有意义），不能截断负数
+        x = self.select_linear_3(x)                # [num_edges, 256] → [num_edges, 1]
+        
+        return x  # 返回原始分数(logit)，后续由 Gumbel_process 处理成 0/1 决策
+
+
+class Aggregator(nn.Module):
+    """
+    用户-物品协同过滤聚合器，对应论文 Section 3.3
+    
+    使用稀疏矩阵乘法实现消息传递（类似 LightGCN 的做法）：
+    - user_agg = A_ui × item_emb  (用户聚合其交互过的物品嵌入)
+    - item_agg = A_iu × user_emb  (物品聚合与其交互过的用户嵌入)
+    
+    参数:
+        n_users, n_items: 用户/物品数量
+        n_entity, n_relation: 实体/关系数量（当前未使用）
+        gamma, max_iter: 迭代参数（当前未使用）
+    """
+    def __init__(self, n_users, n_items, n_entity, n_relation, gamma, max_iter):
+        super(Aggregator, self).__init__()  # 同样必须调用父类构造函数
+        self.n_users = n_users        # 保存用户数量
+        self.n_items = n_items        # 保存物品数量
+        self.n_entity = n_entity      # 保存KG实体数量（本类未使用）
+        self.n_relation = n_relation  # 保存KG关系数量（本类未使用）
+        self.gamma = gamma            # 控制参数（本类未使用）
+        self.max_iter = int(max_iter) # 最大迭代数（本类未使用）
+        self.dim = 128                # 嵌入维度
+
+        # LeakyReLU：和ReLU类似，但负数不变为0，而是乘一个很小的系数（默认0.01）
+        # 即 LeakyReLU(x) = x if x>0 else 0.01*x
+        # 好处：负数区域也有微小梯度，避免"神经元死亡"问题（本类未实际使用）
+        self.activation = nn.LeakyReLU()
+
+    def gumbel_process(self, action_prob, tau=1, dim=-1, hard=True):
+        """
+        Gumbel-Softmax 采样（离散化技巧，使类别选择可导）
+        
+        当 hard=True 时，前向传播用 argmax（离散），
+        反向传播用 softmax 的梯度（连续），实现直通估计器（Straight-Through）。
+        
+        【为什么需要这个技巧？】
+            我们想做"选一个类别"（如保留/丢弃），但argmax不可导。
+            Gumbel-Softmax通过加随机噪声+softmax来近似，同时保持可导性。
+        """
+        # torch.empty_like(x): 创建与x形状相同的"空"张量（内容未初始化）
+        # .exponential_(): 原地填充为指数分布的随机数（>0）
+        # .log(): 取对数
+        # 整个式子 -log(exponential) 就是从 Gumbel(0,1) 分布采样随机噪声
+        gumbels = (
+            -torch.empty_like(action_prob, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        )  # 采样 Gumbel(0,1) 噪声
+
+        gumbels = (action_prob + 0.5 * gumbels) / tau  # 原始分数 + 缩放后的噪声，再除以温度
+
+        # softmax: 把任意实数向量转换为"概率分布"（所有值在0~1之间，且和为1）
+        # 公式：softmax(x_i) = exp(x_i) / Σ exp(x_j)
+        y_soft = gumbels.softmax(dim)
+
+        if hard:
+            # .max(dim)[1]: 在指定维度取最大值，[1]返回最大值的索引位置
+            index = y_soft.max(dim, keepdim=True)[1]
+            # scatter_(dim, index, 1.0): 创建one-hot向量（在index位置填1，其余为0）
+            y_hard = torch.zeros_like(action_prob, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
+            # ★ 直通估计器(Straight-Through Estimator) ★
+            # y_hard - y_soft.detach() + y_soft
+            # 效果：前向传播时值 = y_hard（离散0/1），反向传播时梯度来自 y_soft（连续可导）
+            # .detach() 的含义：切断梯度流，让这个张量不参与反向传播
+            ret = y_hard - y_soft.detach() + y_soft
+        else:
+            ret = y_soft
+        return ret
+
+    
+    def cosin_smi(self, a, b):
+        """计算余弦相似度（批量版本）"""
+        if len(a.shape) != 3:
+            a = a.unsqueeze(1)
+            b = b.unsqueeze(1)
+        a_norm = a / (torch.norm(a, dim=-1, keepdim=True) + 1e-5)
+        b_norm = b / (torch.norm(b, dim=-1, keepdim=True) + 1e-5)
+        return torch.matmul(a_norm, b_norm.transpose(1, 2))
+
+    def _half_mask(self, a, b):
+        """随机半掩码（互补掩码，当前未使用）"""
+        ab_sig = torch.sigmoid(torch.rand(a.shape)).to(a.device)
+        ab_mask = torch.bernoulli(ab_sig)
+        ab_mask_rev = (ab_mask < 1).float()
+        mask_a = a * ab_mask
+        mask_b = b * ab_mask_rev
+        return mask_a, mask_b
+
+
+    def forward(self, user_emb, item_emb, interact_mat):
+        """
+        CF聚合前向传播
+        
+        参数:
+            user_emb: 用户嵌入 [n_users, dim*3]
+            item_emb: 物品嵌入 [n_items, dim*3]
+            interact_mat: 用户-物品交互稀疏矩阵
+        
+        返回:
+            user_agg_cf: 聚合后的用户嵌入（物品信息聚合到用户）
+            item_agg_cf: 聚合后的物品嵌入（用户信息聚合到物品）
+        """
+        # 【什么是稀疏矩阵？】
+        #   假1000个用户×2000个物品，交互矩阵有200万个元素
+        #   但每个用户只买了几十个物品，绝大多数位置是0
+        #   "稀疏矩阵"只存储非零值的(行号,列号,值)，大大节省内存
+        #   例：用户3买了物品7 → 只存(3, 7, 1)而不是存整个200万矩阵
+        
+        # _indices(): 获取稀疏矩阵中所有非零元素的位置索引
+        #   返回 [2, nnz]，第0行=行索引，第1行=列索引（nnz=非零元素数量）
+        # _values(): 获取对应位置的值（交互值，通常全是1）
+        mat_row = interact_mat._indices()[0, :]  # [nnz] 所有交互的用户ID
+        mat_col = interact_mat._indices()[1, :]  # [nnz] 所有交互的物品ID
+        mat_val = interact_mat._values()          # [nnz] 交互值（通常全为1）
+ 
+        # torch.cat([a, b]): 拼接两个张量（concatenate的缩写）
+        # .view(2, -1): 重塑为2行，列数自动推算（-1表示自动计算）
+        # torch.sparse.FloatTensor(indices, values, size): 用坐标格式创建稀疏矩阵
+        #   indices: [2, nnz] 每列是一个(行号, 列号)
+        #   values: [nnz] 对应的值
+        #   size: 矩阵的完整尺寸
+        user_item_mat = torch.sparse.FloatTensor(torch.cat([mat_row, mat_col]).view(2, -1), mat_val,
+                                                 size=[self.n_users, self.n_items])
+        # 转置版本：行列互换，变成物品→用户矩阵
+        item_user_mat = torch.sparse.FloatTensor(torch.cat([mat_col, mat_row]).view(2, -1), mat_val,
+                                                 size=[self.n_items, self.n_users]) 
+        # ★ 核心操作：稀疏矩阵 × 密集矩阵 = 消息传递 ★
+        # torch.sparse.mm(A, B): 稀疏矩阵A乘以密集矩阵B
+        # user_item_mat[n_users, n_items] × item_emb[n_items, dim]
+        #   = 每个用户的嵌入 = 他交互过的所有物品嵌入的（加权）求和
+        #   这就是"消息传递"：物品的信息"传递"到了用户上
+        user_agg_cf = torch.sparse.mm(user_item_mat, item_emb)  # [n_users, dim]
+        # 反方向：用户的信息传递到物品上
+        item_agg_cf = torch.sparse.mm(item_user_mat, user_emb)  # [n_items, dim]
+
+        return user_agg_cf, item_agg_cf
+
+
+class GraphConv(nn.Module):
+    """
+    ★ 图卷积主模块 ★
+    对应论文 Section 3.2-3.3 的核心实现
+    
+    功能：
+        1. 对Primary KG和Potential KG分别进行APL属性筛选（Section 3.2.1）
+        2. 使用Gumbel-Max进行可微的离散属性采样（Section 3.2.1）
+        3. KG消息传递（Section 3.3）：聚合邻居实体信息
+        4. CF消息传递（Section 3.3）：聚合用户-物品交互信息
+        5. 计算MMD损失用于知识蒸馏（Section 3.2.2）
+    
+    参数:
+        channel: 嵌入维度（论文中 d=128）
+        n_hops: GNN层数（论文中 L=2）
+        interact_mat: 用户-物品交互稀疏矩阵
+        node_dropout_rate: 节点丢弃率
+        mess_dropout_rate: 消息丢弃率
+    """
+
+    def __init__(self, channel, n_hops, n_users,
+                 n_items, n_entities, n_relations, interact_mat, gamma, max_iter,
+                 device, node_dropout_rate=0.5, mess_dropout_rate=0.1):
+        super(GraphConv, self).__init__()
+        self.channel = channel          # 单组嵌入维度（如128）
+        # nn.ModuleList(): PyTorch的"模块列表"
+        # 【为什么不用普通的Python list？】
+        #   用nn.ModuleList后，PyTorch才能"看到"列表里的子模块
+        #   这样model.parameters()才会包含子模块的参数，优化器才能更新它们
+        self.convs = nn.ModuleList()    # 存放多层CF聚合器
+        self.interact_mat = interact_mat  # 用户-物品交互稀疏矩阵
+        self.n_relations = n_relations
+        self.n_users = n_users
+        self.n_items = n_items
+        self.n_entity = n_entities
+        self.node_dropout_rate = node_dropout_rate
+        self.mess_dropout_rate = mess_dropout_rate
+        self.device = device            # 计算设备（CPU 或 GPU）
+        self.act_func = nn.LeakyReLU()
+        
+        # ===== 两个APL实例 =====
+        # 创建两个 SelectAgent（前面定义的3层MLP）
+        # 分别用于 Primary KG 和 Potential KG
+        # 输入维度 = channel * 3 = 384，因为拼接了 [head_emb, rel_emb, tail_emb]
+        self.Select_agent = SelectAgent(channel * 3, 1)    # Primary KG 的APL
+        self.N_Select_agent = SelectAgent(channel * 3, 1)  # Potential KG 的APL
+
+        # 交叉熵损失函数（备用）
+        # label_smoothing=0.2: 标签平滑，防止模型过于自信
+        self.bce_loss = nn.CrossEntropyLoss(label_smoothing=0.2)
+        
+        # ===== 关系嵌入（可学习参数） =====
+        # 【torch.empty(a, b)】创建形状为[a,b]的空张量（内容未初始化）
+        # 【nn.init.xavier_uniform_()】Xavier初始化：让权重的初始值不大不小
+        #   太大→梯度爆炸，太小→梯度消失，Xavier根据输入输出维度自动计算合适范围
+        #   末尾的 _ 表示"原地操作"（直接修改张量本身，不返回新张量）
+        # 【nn.Parameter()】把普通张量"注册"为模型的可学习参数
+        #   被 nn.Parameter 包裹后，优化器(如Adam)会自动更新它
+        #   不用 nn.Parameter 的话，这个张量只是普通数据，不会被训练
+        relation_weight = nn.init.xavier_uniform_(torch.empty(n_relations, channel))  
+        self.relation_weight = nn.Parameter(relation_weight)  # Primary KG 关系嵌入 [n_relations, channel]
+        n_relation_weight = nn.init.xavier_uniform_(torch.empty(n_relations, channel))  
+        self.n_relation_weight = nn.Parameter(n_relation_weight)  # Potential KG 关系嵌入
+        
+        # ===== KGC 模型 =====
+        # 知识图谱补全模型，作为"教师"提供知识蒸馏（论文 Section 3.2.2）
+        self.kgc = KGC(n_items=self.n_items, num_ent=self.n_entity, num_rel=self.n_relations, dim=channel)
+        
+        # ===== 构建多层CF聚合器 =====
+        # n_hops=2 时，创建2个 Aggregator（对应2层GNN）
+        # .to(self.device): 把模块搬到指定设备（GPU或CPU）上
+        for i in range(n_hops):
+            self.convs.append(Aggregator(n_users=n_users, n_items=n_items, n_entity=n_entities, 
+                                        n_relation=n_relations, gamma=gamma, max_iter=max_iter).to(self.device))
+
+        # nn.Dropout(p=0.1): 训练时随机把10%的神经元输出置0，防止过拟合
+        # 就像考试时随机遮住10%的笔记，迫使你真正理解而不是死记硬背
+        self.dropout = nn.Dropout(p=mess_dropout_rate)
+
+    def _update_knowledge(self, two_hpo_kg):
+        """
+        更新 Potential KG（候选知识图谱）的边信息
+        
+        在 main.py 中每3个epoch调用一次，传入新生成的候选三元组。
+        
+        参数:
+            two_hpo_kg: 候选三元组数组 [N, 3]，每行 [head, relation, tail]
+        """
+        self.n_edge_index = two_hpo_kg[:, [0, -1]].transpose(1, 0)  # [2, N] 头尾索引
+        self.n_edge_type = two_hpo_kg[:, 1]                          # [N] 关系类型
+        
+    def _edge_sampling(self, edge_index, edge_type, rate=0.5):
+        """边采样：随机保留 rate 比例的边"""
+        n_edges = edge_index.shape[1]
+        random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
+        return edge_index[:, random_indices], edge_type[random_indices]
+
+    def _edge_sampling_01(self, edge_index, edge_type, rate=0.5):
+        """生成01掩码的边采样（当前未使用）"""
+        n_edges = edge_index.shape[1]
+        m = np.random.choice([0, 1], size=n_edges, p=[0.0, 1.0])
+        return m
+
+    def _sparse_dropout(self, x, rate=0.5):
+        """
+        稀疏矩阵的 dropout
+        
+        随机丢弃稀疏矩阵中的部分非零元素（用于节点dropout正则化）。
+        """
+        # x._nnz(): 获取稀疏矩阵中非零元素的数量（nnz = number of non-zeros）
+        noise_shape = x._nnz()
+        # 生成随机数：每个非零元素获得一个 [0,1) 的随机数，加上rate
+        random_tensor = rate
+        random_tensor += torch.rand(noise_shape).to(x.device)
+        # torch.floor(): 向下取整。当随机数+rate >= 1时→True（保留），否则False（丢弃）
+        # 概率为(1-rate)保留。例如rate=0.5时，50%的元素被保留
+        dropout_mask = torch.floor(random_tensor).type(torch.bool)
+        i = x._indices()                                             # 稀疏矩阵的索引 [2, nnz]
+        v = x._values()                                              # 稀疏矩阵的值 [nnz]
+
+        i = i[:, dropout_mask]                                       # 只保留未被丢弃的索引
+        v = v[dropout_mask]                                          # 只保留未被丢弃的值
+
+        out = torch.sparse.FloatTensor(i, v, x.shape).to(x.device)  # 用保留的元素重建稀疏矩阵
+        return out
+
+    def Gumbel_process(self, action_prob, tau=1, dim=-1, hard=True):
+        """
+        Gumbel-Sigmoid 采样（论文 Eq.6-8 的实现）
+        
+        用于将APL输出的连续分数离散化为保留/丢弃决策，同时保持可微性。
+        
+        参数:
+            action_prob: APL输出的原始分数 [num_edges, 1]
+            tau: 温度参数（越小越接近离散）
+        
+        返回:
+            y_soft: 软掩码（sigmoid输出，0~1连续值，用于反向传播）
+            y_hard: 硬掩码（二值化，>0.1视为保留，用于前向传播）
+        """
+        gumbels = (
+            -torch.empty_like(action_prob, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        )  # 采样 Gumbel(0,1) 噪声
+        
+        gumbels = (action_prob + gumbels) / tau  # APL原始分数 + Gumbel噪声，再除以温度tau
+        
+        # torch.sigmoid(): Sigmoid函数，把任意实数压缩到 (0, 1) 区间
+        # 公式: sigmoid(x) = 1 / (1 + e^(-x))
+        # 当x很大时→接近1，x很小时→接近0，x=0时→0.5
+        y_soft = torch.sigmoid(gumbels)          # 软掩码：连续值 (0, 1)
+        
+        # 硬阈值二值化：大于0.1的设为1.0（保留），否则设为0.0（丢弃）
+        # .float(): 把 True/False 转换为 1.0/0.0
+        y_hard = (y_soft > 0.1).float()          # 硬掩码：离散值 {0, 1}
+
+        return y_soft, y_hard
+    
+    def Dnoise_KG(self, edge_index, edge_type, entity_emb, relation_weight, is_gumble=True, new=False):
+        """
+        ★ APL属性筛选的完整流程 ★
+        对应论文 Section 3.2.1, Eq.5-8
+        
+        对KG中的每条边，计算其任务相关性分数，然后通过Gumbel采样决定保留或丢弃。
+        
+        参数:
+            edge_index: [2, num_edges] 边的头尾索引
+            edge_type: [num_edges] 边的关系类型
+            entity_emb: 实体嵌入 [n_entities, channel]
+            relation_weight: 关系嵌入 [n_relations, channel]
+            is_gumble: 是否使用 Gumbel采样（训练时True，推理时False）
+            new: True表示处理Potential KG（用N_Select_agent），False表示Primary KG
+        
+        返回:
+            action_soft: 软掩码分数 [num_edges, 1]（反向传播用）
+            action_hard: 硬掩码 [num_edges, 1]（前向传播用，0或1）
+        """
+        # edge_index 形状 [2, num_edges]，第0行是所有边的头实体ID，第1行是尾实体ID
+        # 用Python解包赋值：head = edge_index[0], tail = edge_index[1]
+        head, tail = edge_index
+        
+        # ★ 张量索引（非常重要的PyTorch操作！）★
+        # entity_emb[head] 的含义：用head中的ID作为索引，从 entity_emb 中取对应行
+        # 例如：head = [3, 7, 3, 5]
+        #       entity_emb[head] → [entity_emb[3], entity_emb[7], entity_emb[3], entity_emb[5]]
+        # 这叫"花式索引"(fancy indexing)，是神经网络中最常用的操作之一
+        head_emb = entity_emb[head]     # [num_edges, channel] 每条边头实体的嵌入
+        tail_emb = entity_emb[tail]     # [num_edges, channel] 每条边尾实体的嵌入
+        rel_emb = relation_weight[edge_type]  # [num_edges, channel] 每条边的关系嵌入
+        
+        # torch.cat([a, b, c], dim=-1): 沿最后一个维度拼接张量
+        #   三个 [num_edges, channel] 拼接后 → [num_edges, channel*3]
+        # F.normalize(): L2归一化，让每行向量的模长=1
+        #   公式: x_norm = x / ||x||_2
+        #   为什么要归一化？防止嵌入向量的大小差异影响APL的判断
+        h_r_t_emb = F.normalize(torch.cat([head_emb, rel_emb, tail_emb], dim=-1))
+
+        # 选择对应的APL网络，调用SelectAgent的forward方法
+        # 记住：写 self.Select_agent(x) 就是调用 SelectAgent.forward(x)
+        # ★ 分批处理：边数太多时一次性过MLP会OOM，分批计算再拼接 ★
+        agent = self.N_Select_agent if new else self.Select_agent
+        CHUNK = 500000  # 每批最多处理50万条边
+        num_edges = h_r_t_emb.shape[0]
+        if num_edges <= CHUNK:
+            action_prob = agent(h_r_t_emb)
+        else:
+            action_prob_chunks = []
+            for start in range(0, num_edges, CHUNK):
+                action_prob_chunks.append(agent(h_r_t_emb[start:start + CHUNK]))
+            action_prob = torch.cat(action_prob_chunks, dim=0)
+
+        if is_gumble:
+            # 训练时：用Gumbel采样，使离散决策可导（可以计算梯度）
+            action_soft, action_hard = self.Gumbel_process(action_prob, tau=1, dim=-1, hard=True)
+        else:
+            # 推理/测试时：直接sigmoid后用阈值判断，不需要梯度
+            action_soft = torch.sigmoid(action_prob)
+            action_hard = (action_soft > 0.1).float()
+        return action_soft, action_hard
+
+    def KG_forward(self, entity_emb, edge_index, edge_type,
+                   relation_weight, KG_drop_soft, KG_drop_hard):
+        """
+        KG消息传递（一层GNN聚合），对应论文 Section 3.3 中的知识聚合
+        
+        公式：entity_agg[i] = Σ_j (tail_emb[j] + rel_emb[j]) * mask[j] / Σ mask[j]
+        
+        参数:
+            entity_emb: 当前层实体嵌入 [n_entities, channel]
+            edge_index: [2, num_edges]
+            edge_type: [num_edges]
+            relation_weight: 关系嵌入
+            KG_drop_soft: APL软掩码（提供梯度）
+            KG_drop_hard: APL硬掩码（决定保留/丢弃）
+        
+        返回:
+            entity_agg: 聚合后的实体嵌入 [n_entities, channel]
+            score_mask: 没有邻居的实体掩码（用于残差连接）
+        """
+        n_entities = entity_emb.shape[0]  # .shape[0] 获取第0维大小（即实体总数）
+        head, tail = edge_index  # 解包：head=[所有边的头实体ID], tail=[所有边的尾实体ID]
+
+        # 花式索引：用ID列表从嵌入表中取对应行
+        head_emb = entity_emb[head]              # [num_edges, channel]
+        tail_emb = entity_emb[tail]              # [num_edges, channel]
+        rel_emb = relation_weight[edge_type]     # [num_edges, channel]
+        
+        # 综合掩码 = 软掩码 × 硬掩码
+        # 硬掩码决定0/1（保留/丢弃），软掩码提供0~1的连续值（梯度通过它反传）
+        # 两者相乘：被丢弃的边 → 0×任何值=0；被保留的边 → 1×软分数=软分数
+        KG_score = KG_drop_soft * KG_drop_hard   # [num_edges, 1]
+        
+        # 构造消息：(尾实体嵌入 + 关系嵌入) × 掩码分数
+        # 被丢弃的边（掩码=0）→ 消息全为0，不贡献信息
+        neb_kg_emb = (tail_emb + rel_emb) * KG_score  # [num_edges, channel]
+        
+        # ★ scatter_sum：按索引分组求和（GNN消息传递的核心操作！）★
+        # src=neb_kg_emb: 每条边的消息 [num_edges, channel]
+        # index=head: 每条边的目标实体ID（消息要发送给谁）
+        # 效果：把所有发送给实体i的消息加起来 → 实体i的聚合结果
+        # 例如：边0→实体2, 边1→实体5, 边2→实体2
+        #       则 entity_agg[2] = neb_kg_emb[0] + neb_kg_emb[2]（两条边都指向实体2）
+        #            entity_agg[5] = neb_kg_emb[1]
+        entity_agg = scatter_sum(src=neb_kg_emb, index=head, dim_size=n_entities, dim=0)       
+        # 统计每个实体保留了多少条边（用于求平均）
+        score_agg = scatter_sum(src=KG_drop_hard, index=head, dim_size=n_entities, dim=0) 
+        # 均值归一化：总消息 / 保留的边数（+1e-9 防止除以0）
+        entity_agg = entity_agg / (score_agg + 1e-9)
+
+        # score_mask: 标记哪些实体一条边都没保留（score_agg < 1 → True → 1.0）
+        # 这些实体无法从邻居获取信息，后续可以用原始嵌入做补充
+        score_mask = (score_agg < 1).float()
+        return entity_agg, score_mask
+
+
+    
+    def split_kg(self, edge_index, edge_type, kg_mask_size=512):
+        """
+        分割KG：随机选取一部分边用于MAE预训练（当前未使用）
+        """
+        n_edges = edge_index.shape[1]
+        random_indices = np.random.choice(
+            n_edges, size=kg_mask_size, replace=False)
+        random_mask = np.zeros(edge_index.shape[1], dtype=bool)
+        random_mask[random_indices] = True
+
+        mask_edge_index = edge_index[:, random_mask]
+        mask_edge_type = edge_type[random_mask]
+        
+        retain_edge_index = edge_index[:, ~random_mask]
+        retain_edge_type = edge_type[~random_mask]
+        
+        return retain_edge_index, retain_edge_type, mask_edge_index, mask_edge_type
+    
+    def create_mae_loss(self, node_pair_emb, masked_edge_emb=None):
+        """MAE（掩码自编码器）损失（当前未使用）"""
+        head_embs, tail_embs = node_pair_emb[:, 0, :], node_pair_emb[:, 1, :]
+        if masked_edge_emb is not None:
+            pos1 = tail_embs * masked_edge_emb
+        else:
+            pos1 = tail_embs
+        scores = - \
+            torch.log(torch.sigmoid(torch.mul(pos1, head_embs).sum(1))).mean()
+        return scores
+    
+    def create_bpr_loss(self, users, pos_items, neg_items):
+        """BPR损失：正样本评分应高于负样本评分"""
+        batch_size = users.shape[0]
+        pos_scores = torch.sum(torch.mul(users, pos_items), axis=1)
+        neg_scores = torch.sum(torch.mul(users, neg_items), axis=1)
+
+        mf_loss = -1 * torch.mean(nn.LogSigmoid()(pos_scores - neg_scores))
+        return mf_loss
+    
+    def create_bce_loss(self, head_emb, rel_emb, target_id, all_embed):
+        """BCE损失（当前未使用）"""
+        merge = head_emb + rel_emb
+        score = torch.matmul(merge, all_embed.transpose(1, 0))
+        bce_loss = self.bce_loss(score, target_id)
+        return bce_loss
+    
+    def _guassian_kernel(self, kg_drb, cf_drb, kernel_mul=2.0, kernel_num=5):
+        """
+        高斯核函数，用于 MMD 计算
+        对应论文 Eq.14 中的核函数
+        
+        使用多个不同带宽的高斯核（multi-scale），提高鲁棒性。
+        
+        参数:
+            kg_drb: KGC模型的输出分布
+            cf_drb: APL的输出分布
+            kernel_mul: 相邻核带宽的倍数
+            kernel_num: 核的数量
+        """
+        n_samples = int(kg_drb.size()[0]) + int(cf_drb.size()[0])
+        # torch.cat([a, b], dim=0): 沿第0维（行方向）拼接两个张量
+        total = torch.cat([kg_drb, cf_drb], dim=0)
+        
+        # 计算所有样本对之间的 L2 距离
+        # .unsqueeze(0): 在第0维插入一个维度，[N, D] → [1, N, D]
+        # .unsqueeze(1): 在第1维插入一个维度，[N, D] → [N, 1, D]
+        # .expand(): 将张量扩展（复制）到指定形状，不实际复制内存
+        # 这样 total0[i,j,:] = total[i,:] 和 total1[i,j,:] = total[j,:]
+        # 相减后就能计算每对样本之间的差异
+        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        L2_distance = ((total0 - total1) ** 2).sum(2)  # [N, N] 每对样本的L2距离的平方
+        
+        # 自适应带宽：使用所有样本对的平均距离
+        bandwidth = torch.sum(L2_distance.data) / (n_samples ** 2 - n_samples)
+
+        # 构建多尺度核：带宽从小到大
+        bandwidth /= kernel_mul ** (kernel_num // 2)
+        bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
+
+        # 计算每个核的值并求和
+        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+        return sum(kernel_val)
+    
+    def _cal_mmd(self, kg_drb, cf_drb, kernel_mul=2.0, kernel_num=5):
+        """
+        ★ 计算 MMD（最大均值差异）损失 ★
+        对应论文 Section 3.2.2, Eq.14-17
+        
+        MMD 衡量两个分布的差异：
+        - kg_drb: KGC模型（教师）的预测分布
+        - cf_drb: APL（学生）的输出分布
+        
+        公式: MMD² = E[k(x,x')] + E[k(y,y')] - 2E[k(x,y)]
+        其中 x~P（KGC分布），y~Q（APL分布），k为高斯核
+        
+        目标：最小化 MMD，使APL的筛选行为向KGC靠近（知识蒸馏）
+        """
+        batch_size = int(kg_drb.size()[0]) 
+        kernels = self._guassian_kernel(kg_drb, cf_drb,
+            kernel_mul=kernel_mul, kernel_num=kernel_num)
+        XX = kernels[:batch_size, :batch_size]    # k(x, x')：KGC内部相似度
+        YY = kernels[batch_size:, batch_size:]    # k(y, y')：APL内部相似度
+        XY = kernels[:batch_size, batch_size:]    # k(x, y)：交叉相似度
+        YX = kernels[batch_size:, :batch_size]    # k(y, x)：交叉相似度
+        mmd_loss = torch.mean(XX + YY - XY - YX)  # MMD² 估计
+        return mmd_loss
+    
+
+    
+    def forward(self, all_embed, all_embed_cf, edge_index, edge_type, n_edge_index, n_edge_type, 
+                interact_mat, mess_dropout=True, node_dropout=False, gumbel=True):
+        """
+        ★ GraphConv 前向传播 —— 整个EditKG的核心计算流程 ★
+        
+        参数:
+            all_embed: 所有节点嵌入 [n_nodes, dim*3]
+            all_embed_cf: CF嵌入（当前为None）
+            edge_index: Primary KG边索引 [2, E1]
+            edge_type: Primary KG边类型 [E1]
+            n_edge_index: Potential KG边索引 [2, E2]
+            n_edge_type: Potential KG边类型 [E2]
+            interact_mat: 用户-物品交互稀疏矩阵
+            mess_dropout: 是否使用消息dropout
+            node_dropout: 是否使用节点dropout
+            gumbel: 是否使用Gumbel采样（训练True，推理False）
+        
+        返回:
+            user_embed_res: 最终用户嵌入 [n_users, dim*3]（多层聚合的残差和）
+            item_embed_res: 最终物品嵌入 [n_items, dim*3]（多层聚合的残差和）
+            KG_drop_hard: Primary KG的硬掩码（哪些边被保留）
+            mmd_loss: MMD损失值
+        
+        计算流程：
+            1. 节点dropout（可选）
+            2. 构建用户-物品和物品-用户稀疏矩阵
+            3. 拆分all_embed为三组嵌入：CF嵌入、Primary KG嵌入、Potential KG嵌入
+            4. 对两个KG分别执行APL筛选（Dnoise_KG）
+            5. 计算MMD损失（KGC教师 vs APL学生）
+            6. 多层KG消息传递 + 残差连接
+            7. 拼接三组嵌入
+            8. 多层CF聚合 + 残差连接
+        """
+        # 第一步：节点dropout正则化
+        if node_dropout:
+            interact_mat = self._sparse_dropout(interact_mat, self.node_dropout_rate)          
+            
+        mat_row = interact_mat._indices()[0, :]  # 用户ID
+        mat_col = interact_mat._indices()[1, :]  # 物品ID
+        mat_val = interact_mat._values()          # 交互值
+
+        user_item_mat = torch.sparse.FloatTensor(torch.cat([mat_row, mat_col]).view(2, -1), mat_val,
+                                                 size=[self.n_users, self.n_items])
+        item_user_mat = torch.sparse.FloatTensor(torch.cat([mat_col, mat_row]).view(2, -1), mat_val,
+                                                 size=[self.n_items, self.n_users]) 
+        
+        # 第二步：拆分 all_embed 为三组嵌入
+        #
+        # 【张量切片语法（非常重要！）】
+        # tensor[a:b]     → 取第a行到第b-1行（左闭右开）
+        # tensor[:n]      → 取前n行（从头取到第n-1行）
+        # tensor[n:]      → 取第n行到最后
+        # tensor[:, a:b]  → 所有行的第a列到第b-1列
+        # tensor[:, :d]   → 所有行的前d列
+        # 可以连续切片：tensor[行切片][:, 列切片]
+        #
+        # all_embed 是一个 [n_nodes, dim*3] 的大矩阵：
+        #   行：前 n_users 行是用户，后 n_entities 行是实体
+        #   列：前 dim 列=CF嵌入，中 dim 列=Primary KG嵌入，后 dim 列=Potential KG嵌入
+        #
+        # 用户需要完整的 dim*3 列（因为用户参与CF聚合时要和物品的3组嵌入对齐）
+        user_embeds = all_embed[:self.n_users]  # 用户嵌入 [n_users, dim*3]
+        # 物品的CF嵌入：只取前dim列
+        item_embed = all_embed[self.n_users:self.n_users + self.n_items][:, :self.channel]  # [n_items, dim]
+        # Primary KG的实体嵌入：取中间dim列
+        entity_emb = all_embed[self.n_users:][:, self.channel:self.channel * 2]  # [n_entities, dim]
+        # Potential KG的实体嵌入：取后dim列
+        n_entity_emb = all_embed[self.n_users:][:, self.channel * 2:]  # [n_entities, dim]
+
+        # 第三步：APL属性筛选 —— 对两个KG分别计算保留/丢弃掩码
+        # Primary KG的APL
+        KG_drop_soft, KG_drop_hard = self.Dnoise_KG(edge_index, edge_type, entity_emb, self.relation_weight, is_gumble=gumbel)
+        # Potential KG的APL
+        N_KG_drop_soft, N_KG_drop_hard = self.Dnoise_KG(self.n_edge_index, self.n_edge_type, n_entity_emb, self.n_relation_weight, is_gumble=gumbel, new=True)
+
+        # 第四步：★ 计算MMD损失（知识蒸馏）★
+        # 从Potential KG中随机采样一批三元组
+        # .unsqueeze(0): 在第0维增加一个维度，[N] → [1, N]（为了后续拼接）
+        # torch.cat([...], dim=0): 沿第0维拼接，[1,N] × 3 → [3, N]
+        # .transpose(1, 0): 转置，[3, N] → [N, 3]，每行变成 [head, relation, tail]
+        kg_trip = torch.cat([self.n_edge_index[0].unsqueeze(0), self.n_edge_type.unsqueeze(0), self.n_edge_index[1].unsqueeze(0)], dim=0).transpose(1, 0)
+        # torch.randint(low, high, size): 生成[low, high)范围内的随机整数
+        # 这里随机选 4096×2=8192 个三元组的索引
+        # .to(device): 把张量搬到和kg_trip相同的设备上（GPU或CPU）
+        mmd_batch = torch.randint(low=0, high=len(kg_trip), size=(int(4096 * 2),)).to(kg_trip.device)   
+        kg_bc_trip = kg_trip[mmd_batch]    # 用随机索引取出一批三元组 [8192, 3]
+        # APL（学生）对这批三元组的输出——取对应位置的软掩码分数
+        bc_n_kg_drop_soft = N_KG_drop_soft[mmd_batch]  # [8192, 1]
+        # KGC（教师）对这批三元组的预测——调用KGC模型打分
+        bc_kgc_soft = self.kgc(kg_bc_trip, eval=True, cf_train=True)  # [8192, 1]
+        bc_kgc_hard = (bc_kgc_soft > 0.1).float().sum()  # 统计教师认为"可信"的三元组数
+        # ★ .detach() 非常重要 ★
+        # 意思是"切断梯度"：教师的输出只提供目标值，不让梯度反传到教师
+        # 这样训练时只更新学生（APL），不更新教师（KGC）
+        bc_kgc_soft = bc_kgc_soft.detach()
+        # 计算MMD损失：衡量学生和教师的输出分布有多不同，越不同损失越大
+        mmd_loss = self._cal_mmd(bc_kgc_soft, bc_n_kg_drop_soft) 
+        
+        # 第五步：多层KG消息传递（带残差连接）
+        # 【什么是残差连接？】
+        #   result = 原始值 + 聚合后的值（而不是直接用聚合后的值替换）
+        #   好处：防止信息在多层传递中丢失，让梯度更容易流动
+        entity_emb_res = entity_emb[:self.n_items]      # Primary KG物品嵌入的残差初始化
+        n_entity_emb_res = n_entity_emb[:self.n_items]   # Potential KG物品嵌入的残差初始化
+        for i in range(len(self.convs)):
+            # Primary KG聚合：调用KG_forward做一层GNN消息传递
+            entity_emb, ent_mask = self.KG_forward(entity_emb, edge_index, edge_type, self.relation_weight, KG_drop_soft, KG_drop_hard)
+            # F.normalize(): L2归一化，防止多层聚合后向量越来越大
+            # 残差连接：上一层结果 + 本层聚合结果
+            entity_emb_res = entity_emb_res + F.normalize(entity_emb[:self.n_items])
+            # Potential KG聚合（同样的操作）
+            n_entity_emb, n_ent_mask = self.KG_forward(n_entity_emb, self.n_edge_index, self.n_edge_type,
+                                                       self.n_relation_weight, N_KG_drop_soft, N_KG_drop_hard)
+            n_entity_emb_res = n_entity_emb_res + F.normalize(n_entity_emb[:self.n_items])
+
+        # 第六步：拼接三组物品嵌入
+        # torch.cat([a, b, c], dim=-1): 沿最后一个维度拼接
+        # 三个 [n_items, dim] 拼接后 → [n_items, dim*3]
+        # item_embeds = [CF嵌入(dim) | Primary KG嵌入(dim) | Potential KG嵌入(dim)]
+        item_embeds = torch.cat([item_embed, entity_emb_res, n_entity_emb_res], dim=-1)
+
+        # 第七步：多层CF聚合（带残差连接）
+        # 调用 Aggregator.forward()，用稀疏矩阵乘法做用户-物品的消息传递
+        user_embed_res = user_embeds
+        item_embed_res = item_embeds
+        for i in range(len(self.convs) - 1):  # 注意：CF聚合层数 = n_hops - 1
+            user_embeds, item_embeds = self.convs[i](user_embeds, item_embeds, self.interact_mat)
+            item_embed_res = item_embed_res + F.normalize(item_embeds)   # 物品嵌入残差累加
+            user_embed_res = user_embed_res + F.normalize(user_embeds)   # 用户嵌入残差累加
+        
+        bce_loss = 0
+        return user_embed_res, item_embed_res, KG_drop_hard, mmd_loss
+
+
+
+class Recommender(nn.Module):
+    """
+    ★ EditKG 推荐系统顶层模型 ★
+    对应论文 Section 3 的整体框架
+    
+    职责：
+        1. 管理所有节点的嵌入参数 all_embed [n_nodes, dim*3]
+        2. 创建并调用 GraphConv 进行图卷积
+        3. 计算推荐损失（交叉熵 or BPR）
+        4. 提供推理接口（generate, rating）
+        5. 转发KGC训练请求
+    
+    嵌入结构（重要！）：
+        all_embed: [n_nodes, dim*3] 的统一嵌入矩阵
+        前 n_users 行是用户嵌入，后 n_entities 行是实体嵌入
+        每行 dim*3 维，拆分为三组：
+        - [:, :dim]        → CF嵌入（用于协同过滤）
+        - [:, dim:dim*2]   → Primary KG嵌入（用于原始KG聚合）
+        - [:, dim*2:]      → Potential KG嵌入（用于候选KG聚合）
+    
+    参数:
+        data_config: 数据规模字典 {n_users, n_items, n_entities, n_nodes, n_relations}
+        args_config: 命令行参数对象
+        graph: NetworkX图（用于提取边）
+        ui_sp_graph: 用户-物品稀疏交互矩阵
+        item_rel_mask: 物品-关系缺失掩码
+        v_feat: 视觉特征 numpy 数组 [n_items, v_dim]（可选）
+        t_feat: 文本特征 numpy 数组 [n_items, t_dim]（可选）
+    """
+    def __init__(self, data_config, args_config, graph, ui_sp_graph, item_rel_mask, v_feat=None, t_feat=None):
+        super(Recommender, self).__init__()
+
+        self.n_users = data_config['n_users']
+        self.n_items = data_config['n_items']
+        self.n_relations = data_config['n_relations']
+        self.n_entities = data_config['n_entities']  # 包含物品
+        self.n_nodes = data_config['n_nodes']  # n_users + n_entities
+
+        self.margin_ccl = args_config.margin
+        self.num_neg_sample = args_config.num_neg_sample
+        
+        self.gamma = args_config.gamma
+        self.max_iter = args_config.max_iter
+        self.decay = args_config.l2              # L2正则化系数
+        self.emb_size = args_config.dim          # 单组嵌入维度（论文中 d=128）
+        self.context_hops = args_config.context_hops  # GNN层数（论文中 L=2）
+        
+        self.node_dropout = args_config.node_dropout
+        self.node_dropout_rate = args_config.node_dropout_rate
+        self.mess_dropout = args_config.mess_dropout
+        self.mess_dropout_rate = args_config.mess_dropout_rate
+        self.loss_f = args_config.loss_f
+        # torch.device: 指定计算设备
+        # 【什么是device？】
+        #   深度学习可以在CPU或GPU上计算，GPU快几十倍
+        #   "cuda:0" 表示第0块GPU，"cpu" 表示CPU
+        #   所有参与计算的张量必须在同一个设备上，否则报错
+        self.device = torch.device("cuda:" + str(args_config.gpu_id)) if args_config.cuda \
+            else torch.device("cpu")
+
+        # torch.FloatTensor(): 创建浮点数张量
+        # .to(self.device): 把张量搬到GPU上
+        self.item_rel_mask = torch.FloatTensor(item_rel_mask).to(self.device)
+        self.ui_sp_graph = ui_sp_graph
+
+        # 从 NetworkX 图中提取边索引和类型，转为GPU张量
+        self.edge_index, self.edge_type = self._get_edges(graph)
+        
+        # Potential KG 的边（初始为None，训练中动态更新）
+        self.n_edge_index = None
+        self.n_edge_type = None
+
+        # nn.CrossEntropyLoss: 交叉熵损失函数
+        # 【什么是交叉熵？】把推荐看作"n_items类的分类问题"
+        #   输入：每个用户对所有物品的分数 [batch, n_items]
+        #   目标：用户实际交互的物品ID（“正确答案”）
+        # label_smoothing=0.85: 标签平滑，将“确定的1”变为“较大的值”，防止过拟合
+        self.cet_loss = nn.CrossEntropyLoss(label_smoothing=0.85)
+        
+        self._init_weight()          # 初始化嵌入参数
+        self._init_loss_function()   # 初始化损失函数
+        self.gcn = self._init_model()  # 创建 GraphConv 模块
+
+        # ===== 多模态特征融合模块（参考 R2MR 的 PCA 降维 + 加权融合方式）=====
+        # 特征已在 data_loader 中通过 PCA 降维到 384 维（= dim*3 = 128*3），
+        # 无需额外 MLP 投影，可直接与 ID 嵌入相加
+        self.use_multimodal = (v_feat is not None) or (t_feat is not None)
+        if v_feat is not None:
+            self.v_feat = torch.FloatTensor(v_feat).to(self.device)  # [n_items, 384]
+            print(f"[MM-DEBUG] v_feat 加载到 {self.device}, shape={self.v_feat.shape}, "
+                  f"范数均值={self.v_feat.norm(dim=1).mean():.4f}")
+        else:
+            self.v_feat = None
+            print(f"[MM-DEBUG] v_feat = None")
+
+        if t_feat is not None:
+            self.t_feat = torch.FloatTensor(t_feat).to(self.device)  # [n_items, 384]
+            print(f"[MM-DEBUG] t_feat 加载到 {self.device}, shape={self.t_feat.shape}, "
+                  f"范数均值={self.t_feat.norm(dim=1).mean():.4f}")
+        else:
+            self.t_feat = None
+            print(f"[MM-DEBUG] t_feat = None")
+
+        # 多模态融合门控权重（可学习的标量，控制多模态信息的融合强度）
+        if self.use_multimodal:
+            self.mm_gate = nn.Parameter(torch.tensor(0.1))  # 初始权重较小，让模型逐步学习融合
+            print(f"[MM-DEBUG] use_multimodal=True, mm_gate 初始值={self.mm_gate.item():.4f}")
+        else:
+            print(f"[MM-DEBUG] use_multimodal=False, 不使用多模态")
+
+        
+        
+    def _init_weight(self):
+        """
+        初始化所有节点的嵌入参数
+        
+        all_embed: [n_nodes, emb_size * 3] —— 每个节点有3组嵌入
+        使用 Xavier 均匀初始化
+        """
+        initializer = nn.init.xavier_uniform_
+        # 步骤：创建空张量 [n_nodes, emb_size*3] 并用Xavier初始化
+        #   torch.empty(): 创建未初始化的张量（内容随机）
+        #   xavier_uniform_(): 用Xavier公式填充合适的初始值
+        self.all_embed = initializer(torch.empty(self.n_nodes, self.emb_size * 3))
+        # 用 nn.Parameter 包裹 → 告诉PyTorch"这是要训练的参数"
+        # 之后优化器(Adam)会自动更新这个矩阵中的值
+        # 这就是整个模型最核心的数据：所有用户和实体的嵌入表
+        self.all_embed = nn.Parameter(self.all_embed)
+
+        self.all_embed_cf = None  # CF嵌入（当前未单独使用，设为None）
+        # 将scipy稀疏矩阵转为PyTorch稀疏张量，并搬到GPU
+        self.interact_mat = self._convert_sp_mat_to_sp_tensor(self.ui_sp_graph).to(self.device)   
+
+    def _convert_sp_mat_to_sp_tensor(self, X):
+        """将 scipy 稀疏矩阵转换为 PyTorch 稀疏张量"""
+        coo = X.tocoo()
+        i = torch.LongTensor([coo.row, coo.col])
+        v = torch.from_numpy(coo.data).float()
+        return torch.sparse.FloatTensor(i, v, coo.shape)
+
+
+    def _init_model(self):#定义模型的前向传播
+        """创建 GraphConv 模块"""
+        return GraphConv(channel=self.emb_size,
+                         n_hops=self.context_hops,
+                         n_users=self.n_users,
+                         n_items=self.n_items,
+                         n_entities=self.n_entities,
+                         n_relations=self.n_relations,
+                         interact_mat=self.interact_mat,
+                         gamma=self.gamma,
+                         max_iter=self.max_iter,
+                         device=self.device,
+                         node_dropout_rate=self.node_dropout_rate,
+                         mess_dropout_rate=self.mess_dropout_rate)
+
+    def _get_edges(self, graph):
+        """从 NetworkX 图中提取边索引和类型，转为GPU张量"""
+        graph_tensor = torch.tensor(list(graph.edges))  
+        index = graph_tensor[:, :-1]  # [head, tail]
+        type = graph_tensor[:, -1]    # relation
+        return index.t().long().to(self.device), type.long().to(self.device)
+
+
+
+    def _init_loss_function(self):
+        """根据配置选择损失函数"""
+        if self.loss_f == "inner_bpr":
+            self.loss = self.create_inner_bpr_loss
+        elif self.loss_f == 'contrastive_loss':
+            self.loss = self.create_contrastive_loss
+        else:
+            raise NotImplementedError
+
+    def L2_norm(self, hidden, k=1):
+        """L2归一化"""
+        hidden_norm = torch.norm(hidden, p=2, dim=-1, keepdim=True)
+        out_hidden = k * torch.div(hidden, hidden_norm + 1e-8)
+        return out_hidden
+
+    def _contrastive_loss(self, user_kg, n_user_kg, pos_user_id, tau=1, small_batch=256):
+        """
+        对比学习损失（当前未使用）
+        
+        目的：拉近同一用户在两个KG视图下的嵌入，推远不同用户的嵌入。
+        """
+        if small_batch:
+            small_id = torch.randint(low=0, high=pos_user_id.shape[0], size=(small_batch,)).to(user_kg.device)
+            pos_user_id = pos_user_id[small_id]
+            
+        pos_user_kge = user_kg[pos_user_id]
+        pos_n_user_kge = n_user_kg[pos_user_id]
+
+        pos = torch.eye(pos_user_kge.shape[0]).to(pos_user_kge.device)
+        z1_norm = torch.norm(pos_user_kge, dim=-1, keepdim=True)
+        z2_norm = torch.norm(pos_n_user_kge, dim=-1, keepdim=True)
+        dot_numerator = torch.mm(pos_user_kge, pos_n_user_kge.t())
+        dot_denominator = torch.mm(z1_norm, z2_norm.t())
+        sim_matrix = torch.exp(dot_numerator / (dot_denominator + 1e-5) / tau)
+        
+        smi_sum = torch.sum(sim_matrix, dim=1).view(-1, 1) + 1e-5
+        sim_matrix = sim_matrix / smi_sum
+        assert sim_matrix.size(0) == sim_matrix.size(1)
+        cl_loss = -torch.log(sim_matrix.mul(pos).sum(dim=-1)).mean()
+
+        return cl_loss
+
+    def _fuse_multimodal(self, item_emb):
+        """
+        ★ 多模态特征融合 ★
+        
+        参考 R2MR 的方式：特征已通过 PCA 降到 384 维（= dim*3 = 128*3），
+        与 ID 嵌入维度完全一致，可直接加权相加，无需 MLP 投影。
+        
+        融合公式：
+            item_emb_final = item_emb + sigmoid(mm_gate) * normalize(v_feat + t_feat)
+        
+        参数:
+            item_emb: GCN 输出的物品 ID 嵌入 [n_items, dim*3=384]
+        
+        返回:
+            融合后的物品嵌入 [n_items, dim*3=384]
+        """
+        if not self.use_multimodal:
+            return item_emb
+        
+        mm_emb = torch.zeros_like(item_emb)
+        
+        if self.v_feat is not None:
+            # 视觉特征已经是 384 维（PCA 降维后），直接相加
+            mm_emb = mm_emb + self.v_feat
+        
+        if self.t_feat is not None:
+            # 文本特征已经是 384 维（PCA 降维后），直接相加
+            mm_emb = mm_emb + self.t_feat
+        
+        # 门控融合：mm_gate 是可学习标量，控制多模态信息的融入程度
+        # sigmoid 确保权重在 (0, 1) 之间
+        gate = torch.sigmoid(self.mm_gate)
+        mm_normed = F.normalize(mm_emb)
+        item_emb_out = item_emb + gate * mm_normed
+
+        # 调试打印（仅在第一次调用时或 _fuse_debug_counter 触发时打印）
+        if not hasattr(self, '_fuse_debug_counter'):
+            self._fuse_debug_counter = 0
+        if self._fuse_debug_counter < 3:  # 前3次调用时打印
+            print(f"[MM-DEBUG] _fuse_multimodal 第{self._fuse_debug_counter}次调用:")
+            print(f"  item_emb   : shape={item_emb.shape}, 范数均值={item_emb.norm(dim=1).mean():.4f}")
+            print(f"  mm_emb     : shape={mm_emb.shape}, 范数均值={mm_emb.norm(dim=1).mean():.4f}")
+            print(f"  mm_normed  : 范数均值={mm_normed.norm(dim=1).mean():.4f}")
+            print(f"  gate       : {gate.item():.6f} (mm_gate原值={self.mm_gate.item():.6f})")
+            print(f"  融合后     : shape={item_emb_out.shape}, 范数均值={item_emb_out.norm(dim=1).mean():.4f}")
+            # ===== 打印 item 0 融合前的两项具体值 =====
+            _id_term = item_emb[0].detach().cpu()          # 第1项: ID embedding (GCN输出)
+            _mm_term = (gate * mm_normed[0]).detach().cpu() # 第2项: 门控×归一化多模态embedding
+            print(f"  --- item 0 融合前两项 ---")
+            print(f"  第1项 ID embedding (item_emb[0])        : 范数={_id_term.norm():.4f}, 前10维={_id_term[:10].tolist()}")
+            print(f"  第2项 多模态项 (gate*mm_normed[0])       : 范数={_mm_term.norm():.4f}, 前10维={_mm_term[:10].tolist()}")
+            print(f"  两项之比 (多模态范数/ID范数)             : {_mm_term.norm() / (_id_term.norm() + 1e-8):.4f}")
+            self._fuse_debug_counter += 1
+        
+        return item_emb_out
+
+    def gcn_forword(self, user, pos_item):#前向传播并计算损失函数
+        """
+        ★ GCN前向传播 + 推荐损失计算（含多模态融合）★
+        
+        参数:
+            user: 批次中的用户ID [batch_size]
+            pos_item: 正样本物品ID [batch_size] 标注正确答案是哪个，从而在后面用self.cet_loss(score, pos_item)计算交叉熵损失
+        
+        返回:
+            cet_loss: 交叉熵损失（将推荐视为多分类问题）
+            mmd_loss: MMD知识蒸馏损失
+        
+        流程:
+            1. 调用 GraphConv 获取用户和物品嵌入
+            2. ★ 融合多模态特征到物品嵌入 ★
+            3. 计算用户-物品评分矩阵
+            4. 使用交叉熵损失（每个用户的正样本物品作为正确类别）
+        """
+        # GCN前向传播，获取聚合后的嵌入
+        user_all_emb, item_all_emb, KG_drop_hard, mmd_loss = self.gcn(self.all_embed,
+                                                            self.all_embed_cf,
+                                                            self.edge_index,
+                                                            self.edge_type,
+                                                            self.n_edge_index,
+                                                            self.n_edge_type,
+                                                            self.interact_mat,
+                                                            mess_dropout=self.mess_dropout,
+                                                            node_dropout=self.node_dropout,
+                                                            gumbel=True)
+
+        # ★ 多模态融合：将视觉/文本特征投影后加到物品嵌入上 ★
+        # 参考 R2MR 的融合方式：MLP投影 + 加权融合
+        item_all_emb = self._fuse_multimodal(item_all_emb)
+
+        # 取当前批次用户的嵌入（花式索引：用用户ID列表从所有用户嵌入中取对应行）
+        user_emb = user_all_emb[user]  # [batch_size, dim*3]
+        # ★ torch.matmul(A, B): 矩阵乘法 ★
+        # .transpose(1, 0): 转置矩阵（行变列，列变行）
+        # user_emb[batch_size, dim*3] × item_all_emb.T[dim*3, n_items]
+        # = score[batch_size, n_items]
+        # 含义：每个用户对每个物品的"内积评分"（越大越可能推荐）
+        score = torch.matmul(user_emb, item_all_emb.transpose(1, 0))
+        # 交叉熵损失：把推荐看作"n_items类的分类问题"
+        # score 是预测的分数，pos_item 是"正确答案"（用户实际交互的物品ID）
+        # CrossEntropyLoss 内部会对score做softmax再取-log
+        cet_loss = self.cet_loss(score, pos_item)
+        
+        # L2正则化（当前注释掉了，未加入损失）
+        pos_emb = item_all_emb[pos_item]
+        regularizer = (torch.norm(user_emb) ** 2
+                       + torch.norm(pos_emb) ** 2)
+ 
+        return cet_loss, mmd_loss 
+    
+
+
+    def forward(self, batch=None, mode="cf"):
+        """
+        模型前向传播入口
+        
+        参数:
+            batch: 训练数据批次
+            mode: "cf" 表示推荐训练，其他表示KGC训练
+        
+        返回:
+            mode="cf": (cet_loss, mmd_loss) 推荐损失和MMD损失
+            mode!="cf": kgc_loss KGC训练损失
+        """
+        if mode == "cf":
+            # ===== 推荐训练模式 =====
+            user = batch['users']       # 批次用户ID
+            pos_item = batch['pos_items']  # 批次正样本物品ID
+
+            loss_network = self.gcn_forword(user, pos_item)
+            return loss_network
+        
+        else:
+            # ===== KGC训练模式 =====
+            kgc_loss = self.gcn.kgc(batch)
+            return kgc_loss
+
+
+    def generate(self, for_kgc=False):
+        """
+        生成推理用的嵌入（不使用dropout和Gumbel采样）
+        
+        被 evaluate.py 中的 test() 函数调用。
+        
+        参数:
+            for_kgc: True返回物品嵌入和KG掩码，False返回物品和用户嵌入
+        
+        返回:
+            for_kgc=False: (item_emb, user_emb) 用于推荐评分
+            for_kgc=True: (item_emb, KG_drop_hard) 用于KGC分析
+        """
+        user_all_emb, item_all_emb, KG_drop_hard, kg_loss = self.gcn(self.all_embed,
+                                                            self.all_embed_cf,
+                                                            self.edge_index,
+                                                            self.edge_type,
+                                                            self.n_edge_index,
+                                                            self.n_edge_type,
+                                                            self.interact_mat,
+                                                            mess_dropout=False,     # 推理时关闭dropout
+                                                            node_dropout=False,
+                                                            gumbel=False)           # 推理时关闭Gumbel
+
+        # ★ 推理时也需要融合多模态特征 ★
+        item_all_emb = self._fuse_multimodal(item_all_emb)
+
+        item_pred_emb = item_all_emb 
+        user_pred_emb = user_all_emb 
+        if for_kgc:
+            return item_pred_emb, KG_drop_hard
+        else:
+            return item_pred_emb, user_pred_emb
+
+
+    def rating(self, u_g_embeddings, i_g_embeddings, type="bpr"):
+        """
+        计算用户-物品评分矩阵
+        
+        参数:
+            u_g_embeddings: 用户嵌入 [batch_users, dim*3]
+            i_g_embeddings: 物品嵌入 [batch_items, dim*3]
+            type: "bpr" 使用内积评分
+        
+        返回:
+            评分矩阵 [batch_users, batch_items]（CPU张量）
+        """
+        if type == "bpr":
+            # torch.matmul: 矩阵乘法
+            # .t(): .transpose(0,1) 的简写，转置矩阵
+            # .detach(): 切断梯度（推理时不需要梯度）
+            # .cpu(): 从GPU搬回CPU（因为后续要用numpy处理，numpy不支持GPU）
+            return torch.matmul(u_g_embeddings, i_g_embeddings.t()).detach().cpu()
+        else:
+            # 余弦相似度版本（分两组嵌入分别计算，当前未使用）
+            return torch.cosine_similarity(u_g_embeddings[:, :self.emb_size].unsqueeze(1),
+                                           i_g_embeddings[:, :self.emb_size].unsqueeze(0), dim=2).detach().cpu() + \
+                   torch.cosine_similarity(u_g_embeddings[:, self.emb_size:].unsqueeze(1),
+                                           i_g_embeddings[:, self.emb_size:].unsqueeze(0), dim=2).detach().cpu()
+
+
+    def create_contrastive_loss(self, u_e, pos_e, neg_e, loss_weight):
+        """对比损失函数：正样本靠近，负样本远离（当前未使用，配置为inner_bpr）"""
+        batch_size = u_e.shape[0]
+
+        u_e = F.normalize(u_e)
+        pos_e = F.normalize(pos_e)
+        neg_e = F.normalize(neg_e)
+
+        ui_pos_loss1 = torch.relu(1 - torch.cosine_similarity(u_e, pos_e, dim=1))
+
+        users_batch = torch.repeat_interleave(u_e, self.num_neg_sample, dim=0)
+
+        ui_neg1 = torch.relu(torch.cosine_similarity(users_batch, neg_e, dim=1) - self.margin_ccl)
+        ui_neg1 = ui_neg1.view(batch_size, -1)
+        x = ui_neg1 > 0
+        ui_neg_loss1 = torch.sum(ui_neg1, dim=-1) / (torch.sum(x, dim=-1) + 1e-5)
+
+        loss = (ui_pos_loss1 + ui_neg_loss1)
+
+        return loss.mean()
+
+
+    def create_inner_bpr_loss(self, users, pos_items, neg_items):
+        """
+        BPR损失 + L2正则化（当前代码实际使用交叉熵损失，此函数为备用）
+        
+        BPR: -log σ(pos_score - neg_score)
+        """
+        batch_size = users.shape[0]
+        pos_scores = torch.sum(torch.mul(users, pos_items), axis=1)
+        neg_scores = torch.sum(torch.mul(users, neg_items), axis=1)
+
+        cf_loss = -1 * torch.mean(nn.LogSigmoid()(pos_scores - neg_scores))
+        # L2正则化
+        regularizer = (torch.norm(users) ** 2
+                       + torch.norm(pos_items) ** 2
+                       + torch.norm(neg_items) ** 2) / 2
+        emb_loss = self.decay * regularizer / batch_size
+
+        return cf_loss + emb_loss
+    
+    
+    
+    
+    
+class KGC(nn.Module):
+    """
+    ★ 知识图谱补全模型 (Knowledge Graph Completion) ★
+    对应论文 Section 3.2.2 (Eq.10-12)
+    
+    功能：
+        用作"教师模型"，通过 MMD 损失将知识蒸馏到推荐模型中。
+    
+    架构：
+        输入: concat([h_emb, r_emb * t_emb])  → dim*2 维
+        MLP: Linear(dim*2, 512) → ReLU → Linear(512, 256) → ReLU → Linear(256, 1)
+        输出: Sigmoid → [0, 1] 的可信度分数
+    
+    论文公式:
+        Eq.10: ŷ_i = σ(MLP(e_h ∥ e_r ⊙ e_t))
+        Eq.11: L_KGC = -Σ[y·log(ŷ) + (1-y)·log(1-ŷ)]  (BCE损失)
+    
+    参数:
+        n_items: 物品数量
+        num_ent: 实体总数（KGC自己的嵌入表）
+        num_rel: 关系总数
+        dim: 嵌入维度
+        margin: MarginRankingLoss 的边距（备用，实际使用BCE）
+    """
+    def __init__(self, n_items, num_ent, num_rel, dim=100, p_norm=1, norm_flag=True, margin=None, epsilon=None):
+        super(KGC, self).__init__()
+        self.n_items = n_items
+        self.dim = dim
+        self.margin = margin
+        self.epsilon = epsilon
+        self.norm_flag = norm_flag
+        self.p_norm = p_norm
+        self.num_ent = num_ent
+        self.num_rel = num_rel
+        
+        # MLP 三层: dim*2 → 512 → 256 → 1
+        self.linear_1 = nn.Linear(self.dim * 2, 512)   # 第1层
+        self.linear_2 = nn.Linear(512, 256)              # 第2层
+        self.linear_pre = nn.Linear(256, 1)              # 预测层（输出1个分数）
+
+        # ★ nn.Embedding(num, dim) —— 嵌入层（查找表）★
+        # 【什么是Embedding？】
+        #   内部就是一个 [num, dim] 的二维矩阵（权重表）
+        #   输入一个整数ID → 输出该行对应的向量
+        #   例: nn.Embedding(1000, 128) → 1000个实体，每个用128维向量表示
+        #       embedding(5) → 返回第5行的128维向量
+        # 【和 nn.Linear 的区别？】
+        #   Linear: 输入是浮点向量，做矩阵乘法 y=xW+b
+        #   Embedding: 输入是整数ID，直接"查表"取对应行，没有矩阵乘法
+        # 【和推荐模型的 all_embed 的区别？】
+        #   KGC有自己独立的嵌入表，不和推荐模型共享
+        #   同一个实体在KGC和推荐模型中有不同的嵌入向量
+        self.ent_embeddings = nn.Embedding(self.num_ent, self.dim)  # 实体嵌入表 [num_ent, dim]
+        self.rel_embeddings = nn.Embedding(self.num_rel, self.dim)  # 关系嵌入表 [num_rel, dim]
+
+        # 损失函数
+        self.loss_F = nn.MarginRankingLoss(self.margin, reduction="mean")  # 备用
+        # nn.BCELoss: 二元交叉熵损失（Binary Cross Entropy）
+        # 用于二分类：预测值∈(0,1)，标签∈{0,1}
+        # 公式: loss = -[y·log(ŷ) + (1-y)·log(1-ŷ)]
+        # y=1时：ŷ越接近1，loss越小（正样本预测对了）
+        # y=0时：ŷ越接近0，loss越小（负样本预测对了）
+        self.bce_loss = nn.BCELoss(reduction="mean")  # reduction="mean" 表示对批次取平均
+
+    def __parameter_init(self, normalize=False):
+        """参数初始化（Xavier均匀初始化，可选归一化）"""
+        nn.init.xavier_uniform_(self.ent_embeddings.weight.data)
+        nn.init.xavier_uniform_(self.rel_embeddings.weight.data)
+        if normalize:
+            self.normalization_rel_embedding()
+            self.normalization_ent_embedding()
+
+    def normalization_ent_embedding(self):
+        """实体嵌入 L2 归一化"""
+        norm = self.ent_embeddings.weight.detach().cpu().numpy()
+        norm = norm / np.sqrt(np.sum(np.square(norm), axis=1, keepdims=True))
+        self.ent_embeddings.weight.data.copy_(torch.from_numpy(norm))
+
+    def normalization_rel_embedding(self):
+        """关系嵌入 L2 归一化"""
+        norm = self.rel_embeddings.weight.detach().cpu().numpy()
+        norm = norm / np.sqrt(np.sum(np.square(norm), axis=1, keepdims=True))
+        self.rel_embeddings.weight.data.copy_(torch.from_numpy(norm))
+    
+    def _convert_sp_mat_to_sp_tensor(self, X):
+        """将 scipy 稀疏矩阵转为 PyTorch 稀疏张量"""
+        coo = X.tocoo()
+        i = torch.LongTensor([coo.row, coo.col])
+        v = torch.from_numpy(coo.data).float()
+        return torch.sparse.FloatTensor(i, v, coo.shape)
+    
+    def _distance(self, h, t, r, neg=False):
+        """TransE 距离计算 ||h + r - t||（备用，未在MLP版本中使用）"""
+        if neg:
+            score = (h + r).unsqueeze(1) - t
+            score = torch.norm(score, p=self.p_norm, dim=-1).mean(dim=1)
+        else:
+            score = (h + r) - t
+            score = torch.norm(score, p=self.p_norm, dim=1)
+        return score
+
+    def forward(self, data, eval=False, rate=0.5, cf_train=False):#输入（h,r,t）三元组---》根据h，r,t查找嵌入----》输入MLP，计算出可信分数---》计算损失函数
+        """
+        KGC 前向传播
+        
+        参数:
+            data: 训练时为字典 {"hr_pair": [h, r, t, label]}
+                  推理时可以是张量 [h, r, t] 或字典
+            eval: True=推理模式（返回分数），False=训练模式（返回损失）
+            rate: 推理时的阈值（未使用）
+            cf_train: True 表示直接传入三元组张量
+        
+        返回:
+            eval=True: score [batch, 1] — 每个三元组的可信度
+            eval=False: loss — BCE损失标量
+        
+        核心计算流程（对应论文 Eq.10）:
+            1. 查找 h, r, t 的嵌入
+            2. 计算 r ⊙ t（关系与尾实体的逐元素乘积）
+            3. 拼接 [h, r⊙t] → dim*2 维
+            4. L2归一化
+            5. MLP: 512 → 256 → 1
+            6. Sigmoid → [0,1]
+        """
+        if eval:
+            # ===== 推理模式：返回可信度分数 =====
+            if cf_train:
+                batch_triple = data        # 直接传入的三元组张量 [batch, 3]
+            else:
+                batch_triple = data["hr_pair"]  # 从字典中取三元组
+            
+            # 张量切片：[:, 0] 取所有行的第0列，[:, 1] 取第1列...
+            batch_h = batch_triple[:, 0]   # [batch] 头实体ID
+            batch_r = batch_triple[:, 1]   # [batch] 关系ID
+            batch_t = batch_triple[:, 2]   # [batch] 尾实体ID
+
+            # 用ID查嵌入表（Embedding就是查表操作）
+            h = self.ent_embeddings(batch_h)  # [batch, dim] 头实体嵌入
+            r = self.rel_embeddings(batch_r)  # [batch, dim] 关系嵌入
+            t = self.ent_embeddings(batch_t)  # [batch, dim] 尾实体嵌入
+            
+            # 论文 Eq.10: ŷ = σ(MLP(h ∥ r⊙t))
+            # r * t: 逐元素相乘（Hadamard积），不是矩阵乘法
+            #   [batch, dim] * [batch, dim] = [batch, dim]，对应位置相乘
+            # torch.cat([h, r*t], dim=-1): 拼接 → [batch, dim*2]
+            # F.normalize: L2归一化，让每行模长=1
+            h_r_t_emb = F.normalize(torch.cat([h, r * t], dim=-1))
+            # 通过3层MLP
+            h_r_t_emb = torch.relu(self.linear_1(h_r_t_emb))   # [batch, dim*2] → [batch, 512]
+            h_r_t_emb = torch.relu(self.linear_2(h_r_t_emb))   # [batch, 512] → [batch, 256]
+            # sigmoid 输出 (0,1) 之间的"可信度分数"
+            score = torch.sigmoid(self.linear_pre(h_r_t_emb))   # [batch, 256] → [batch, 1]
+            return score
+        
+        # ===== 训练模式：返回BCE损失 =====
+        #为什么这里没有nn.Parameter注册可训练参数，因为当我们调用 self.ent_embeddings = nn.Embedding(self.num_ent, self.dim)，以及self.linear_1 = nn.Linear(self.dim * 2, 512) 时，也就是注册embedding层和线性层，它会自动帮我们把这些层的权重参数注册为可训练参数，所以我们不需要手动注册了。
+        batch_triple = data["hr_pair"]
+        
+        batch_h = batch_triple[:, 0]
+        batch_r = batch_triple[:, 1]
+        batch_t = batch_triple[:, 2]
+        batch_label = batch_triple[:, -1]  # 标签：1=正三元组，0=负三元组
+
+        h = self.ent_embeddings(batch_h)
+        r = self.rel_embeddings(batch_r)
+        t = self.ent_embeddings(batch_t)
+        
+        # 同推理模式的MLP计算
+        h_r_t_emb = F.normalize(torch.cat([h, r * t], dim=-1))  # 拼接并归一化
+        h_r_t_emb = torch.relu(self.linear_1(h_r_t_emb))        # MLP第1层
+        h_r_t_emb = torch.relu(self.linear_2(h_r_t_emb))        # MLP第2层
+        score = torch.sigmoid(self.linear_pre(h_r_t_emb))        # 输出可信度分数
+
+        # Eq.11: BCE损失
+        # .squeeze(-1): 去掉最后一个维度，[batch, 1] → [batch]
+        # .float(): 将标签转为浮点数（BCE要求输入必须是浮点数）
+        loss = self.bce_loss(score.squeeze(-1), batch_label.float())
+ 
+        return loss
+
+    def regularization(self, data):
+        """L2正则化（备用）"""
+        batch_h = data['batch_h']
+        batch_t = data['batch_t']
+        batch_r = data['batch_r']
+        h = self.ent_embeddings[batch_h]
+        t = self.ent_embeddings[batch_t]
+        r = self.rel_embeddings[batch_r]
+        regul = (torch.mean(h ** 2) + 
+                    torch.mean(t ** 2) + 
+                    torch.mean(r ** 2)) / 3
+        return regul
