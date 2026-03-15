@@ -420,11 +420,13 @@ def load_multimodal_features(data_dir):
         v_feat = np.load(v_feat_path, allow_pickle=True)
         print(f"[多模态] 加载视觉特征: {v_feat_path}, 原始形状: {v_feat.shape}")
         # 参考 R2MR：对视觉特征做 PCA 降维到 384 维（= dim*3 = 128*3，可直接与 ID 嵌入相加）
+        v_zero_mask = np.all(v_feat == 0, axis=1)  # 标记原始零向量行
         if v_feat.shape[1] > 384:
             v_pca = PCA(n_components=384)
             v_feat = v_pca.fit_transform(v_feat)
             print(f"[多模态]   PCA 降维后形状: {v_feat.shape},  explained_var_ratio 前5: {v_pca.explained_variance_ratio_[:5]}")
         v_feat = np.tanh(v_feat)  # tanh 激活（参考 R2MR）
+        v_feat[v_zero_mask] = 0.0  # 恢复零向量行，避免PCA引入噪声
         # ---------- 调试信息 ----------
         nonzero = np.sum(np.any(v_feat != 0, axis=1))
         print(f"[多模态]   tanh后 → 形状: {v_feat.shape}, 有效行: {nonzero}/{v_feat.shape[0]}, "
@@ -437,11 +439,13 @@ def load_multimodal_features(data_dir):
         t_feat = np.load(t_feat_path, allow_pickle=True)
         print(f"[多模态] 加载文本特征: {t_feat_path}, 原始形状: {t_feat.shape}")
         # 参考 R2MR：对文本特征做 PCA 降维到 384 维（= dim*3 = 128*3）
+        t_zero_mask = np.all(t_feat == 0, axis=1)  # 标记原始零向量行
         if t_feat.shape[1] > 384:
             t_pca = PCA(n_components=384)
             t_feat = t_pca.fit_transform(t_feat)
             print(f"[多模态]   PCA 降维后形状: {t_feat.shape},  explained_var_ratio 前5: {t_pca.explained_variance_ratio_[:5]}")
         t_feat = np.tanh(t_feat)
+        t_feat[t_zero_mask] = 0.0  # 恢复零向量行，避免PCA引入噪声
         # ---------- 调试信息 ----------
         nonzero = np.sum(np.any(t_feat != 0, axis=1))
         print(f"[多模态]   tanh后 → 形状: {t_feat.shape}, 有效行: {nonzero}/{t_feat.shape[0]}, "

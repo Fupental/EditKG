@@ -904,7 +904,7 @@ class Recommender(nn.Module):
 
         # 多模态融合门控权重（可学习的标量，控制多模态信息的融合强度）
         if self.use_multimodal:
-            self.mm_gate = nn.Parameter(torch.tensor(0.1))  # 初始权重较小，让模型逐步学习融合
+            self.mm_gate = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2)≈0.12，从小权重开始逐步学习融合
             print(f"[MM-DEBUG] use_multimodal=True, mm_gate 初始值={self.mm_gate.item():.4f}")
         else:
             print(f"[MM-DEBUG] use_multimodal=False, 不使用多模态")
@@ -1038,8 +1038,7 @@ class Recommender(nn.Module):
         # 门控融合：mm_gate 是可学习标量，控制多模态信息的融入程度
         # sigmoid 确保权重在 (0, 1) 之间
         gate = torch.sigmoid(self.mm_gate)
-        mm_normed = F.normalize(mm_emb)
-        item_emb_out = item_emb + gate * mm_normed
+        item_emb_out = item_emb + gate * mm_emb
 
         # 调试打印（仅在第一次调用时或 _fuse_debug_counter 触发时打印）
         if not hasattr(self, '_fuse_debug_counter'):
@@ -1048,12 +1047,11 @@ class Recommender(nn.Module):
             print(f"[MM-DEBUG] _fuse_multimodal 第{self._fuse_debug_counter}次调用:")
             print(f"  item_emb   : shape={item_emb.shape}, 范数均值={item_emb.norm(dim=1).mean():.4f}")
             print(f"  mm_emb     : shape={mm_emb.shape}, 范数均值={mm_emb.norm(dim=1).mean():.4f}")
-            print(f"  mm_normed  : 范数均值={mm_normed.norm(dim=1).mean():.4f}")
             print(f"  gate       : {gate.item():.6f} (mm_gate原值={self.mm_gate.item():.6f})")
             print(f"  融合后     : shape={item_emb_out.shape}, 范数均值={item_emb_out.norm(dim=1).mean():.4f}")
             # ===== 打印 item 0 融合前的两项具体值 =====
             _id_term = item_emb[0].detach().cpu()          # 第1项: ID embedding (GCN输出)
-            _mm_term = (gate * mm_normed[0]).detach().cpu() # 第2项: 门控×归一化多模态embedding
+            _mm_term = (gate * mm_emb[0]).detach().cpu() # 第2项: 门控×多模态embedding
             print(f"  --- item 0 融合前两项 ---")
             print(f"  第1项 ID embedding (item_emb[0])        : 范数={_id_term.norm():.4f}, 前10维={_id_term[:10].tolist()}")
             print(f"  第2项 多模态项 (gate*mm_normed[0])       : 范数={_mm_term.norm():.4f}, 前10维={_mm_term[:10].tolist()}")

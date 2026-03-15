@@ -421,8 +421,8 @@ if __name__ == '__main__':
         item_embs = item_embs.detach().cpu().numpy()    # 物品嵌入 [n_items, dim*3]
         KG_mask = KG_mask.detach().cpu().numpy()         # APL掩码
 
-        # ----- 评估（每5轮评估一次以加速训练）-----
-        if epoch % 5 == 0 or epoch == 99:
+        # ----- 评估（每轮都评估）-----
+        if epoch % 1 == 0:
             model.eval()
             test_s_t = time()
             with torch.no_grad():

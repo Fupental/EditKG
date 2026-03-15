@@ -68,8 +68,8 @@ def get_feed_data(train_entity_pairs, train_user_set):
     """
     feed_dict = {}
     entity_pairs = train_entity_pairs
-    feed_dict['users'] = entity_pairs[:, 0]
-    feed_dict['pos_items'] = entity_pairs[:, 1]
+    feed_dict['users'] = torch.LongTensor(entity_pairs[:, 0])
+    feed_dict['pos_items'] = torch.LongTensor(entity_pairs[:, 1])
 
     return feed_dict
 
@@ -346,7 +346,12 @@ if __name__ == '__main__':
     KG_mask = []         # APL掩码（指示哪些三元组被保留）
     
     # ===== 8. 主训练循环（100轮）=====
-    for epoch in range(100):
+    total_epochs = 2 if args.quick_test else 100
+    if args.quick_test:
+        print("\n" + "="*60)
+        print("[QUICK TEST] 快速测试模式：仅跑2轮，验证代码路径")
+        print("="*60 + "\n")
+    for epoch in range(total_epochs):
         torch.cuda.empty_cache()
         
         # ----- 每10轮或第0轮：重新打乱训练数据 -----防止模型学到数据的排列顺序，而非数据本身的规律
@@ -373,7 +378,7 @@ if __name__ == '__main__':
             # Step 3: 训练KGC模型（论文 Section 3.2.2, Eq.10-11）
             # 第0轮训练10个epoch来预热，之后只训练1个epoch来微调
             if epoch == 0:
-                kgr_epoch = 10    # 预热轮次（MIND:6, others:8, book:10）
+                kgr_epoch = 1 if args.quick_test else 10    # 预热轮次（MIND:6, others:8, book:10）
             else:
                 kgr_epoch = 1     # 微调轮次（MIND:1, others:2）
             train_kgr_model(model, kgr_optimizer, triplets, kg_mask=KG_mask, epochs=kgr_epoch)
@@ -416,8 +421,8 @@ if __name__ == '__main__':
         item_embs = item_embs.detach().cpu().numpy()    # 物品嵌入 [n_items, dim*3]
         KG_mask = KG_mask.detach().cpu().numpy()         # APL掩码
 
-        # ----- 评估（每5轮评估一次以加速训练）-----
-        if epoch % 5 == 0 or epoch == 99:
+        # ----- 评估（每轮都评估）-----
+        if epoch % 1 == 0:
             model.eval()
             test_s_t = time()
             with torch.no_grad():
