@@ -1038,7 +1038,8 @@ class Recommender(nn.Module):
         # 门控融合：mm_gate 是可学习标量，控制多模态信息的融入程度
         # sigmoid 确保权重在 (0, 1) 之间
         gate = torch.sigmoid(self.mm_gate)
-        item_emb_out = item_emb + gate * mm_emb
+        mm_normed = F.normalize(mm_emb)
+        item_emb_out = item_emb + gate * mm_normed
 
         # 调试打印（仅在第一次调用时或 _fuse_debug_counter 触发时打印）
         if not hasattr(self, '_fuse_debug_counter'):
