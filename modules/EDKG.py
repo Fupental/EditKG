@@ -903,9 +903,18 @@ class Recommender(nn.Module):
             print(f"[MM-DEBUG] t_feat = None")
 
         if self.use_multimodal:
-            print(f"[MM-DEBUG] use_multimodal=True, 多模态嵌入可训练，无门控")
+            # 方案A：独立投影 + 可学习权重
+            # 文本和图像在不同语义空间，先各自投影到共享空间再加权融合
+            mm_dim = self.emb_size * 3  # 384
+            if self.t_feat is not None:
+                self.text_proj = nn.Linear(mm_dim, mm_dim)
+            if self.v_feat is not None:
+                self.image_proj = nn.Linear(mm_dim, mm_dim)
+            self.alpha = nn.Parameter(torch.tensor(0.5))  # 文本融合权重
+            self.beta  = nn.Parameter(torch.tensor(0.5))  # 图像融合权重
+            print(f"[MM] 方案A已启用: 独立投影({mm_dim}→{mm_dim}) + 可学习权重(alpha=0.5, beta=0.5)")
         else:
-            print(f"[MM-DEBUG] use_multimodal=False, 不使用多模态")
+            print(f"[MM] use_multimodal=False, 不使用多模态")
 
         
         
@@ -1006,50 +1015,50 @@ class Recommender(nn.Module):
 
     def _fuse_multimodal(self, item_emb):
         """
-        ★ 多模态特征融合 ★
+        ★ 方案A：独立投影 + 可学习权重 多模态融合 ★
         
-        特征已通过 PCA 降到 384 维（= dim*3 = 128*3），
-        与 ID 嵌入维度完全一致，直接相加，无需 MLP 投影或门控。
-        多模态嵌入（v_feat / t_feat）为可训练 nn.Parameter。
+        文本和图像来自不同编码器（BERT / ViT），语义空间不对齐。
+        各自通过独立线性层投影到共享语义空间，再用可学习标量加权融合。
         
         融合公式：
-            item_emb_final = item_emb + normalize(v_feat + t_feat)
+            t_emb = text_proj(t_feat)
+            v_emb = image_proj(v_feat)
+            mm_emb = alpha * t_emb + beta * v_emb
+            item_emb_final = item_emb + normalize(mm_emb)
         
         参数:
-            item_emb: GCN 输出的物品 ID 嵌入 [n_items, dim*3=384]
-        
+            item_emb: GCN 输出的物品 ID 嵌入 [n_items, 384]
         返回:
-            融合后的物品嵌入 [n_items, dim*3=384]
+            融合后的物品嵌入 [n_items, 384]
         """
         if not self.use_multimodal:
             return item_emb
         
         mm_emb = torch.zeros_like(item_emb)
         
-        if self.v_feat is not None:
-            mm_emb = mm_emb + self.v_feat
-        
         if self.t_feat is not None:
-            mm_emb = mm_emb + self.t_feat
+            t_emb = self.text_proj(self.t_feat)    # 投影到共享空间 [n_items, 384]
+            mm_emb = mm_emb + self.alpha * t_emb
         
-        # 直接相加，无门控，多模态嵌入本身可训练
+        if self.v_feat is not None:
+            v_emb = self.image_proj(self.v_feat)   # 投影到共享空间 [n_items, 384]
+            mm_emb = mm_emb + self.beta * v_emb
+        
         mm_normed = F.normalize(mm_emb)
         item_emb_out = item_emb + mm_normed
 
-        # 调试打印
+        # 调试打印（前3次）
         if not hasattr(self, '_fuse_debug_counter'):
             self._fuse_debug_counter = 0
         if self._fuse_debug_counter < 3:
-            print(f"[MM-DEBUG] _fuse_multimodal 第{self._fuse_debug_counter}次调用:")
-            print(f"  item_emb   : shape={item_emb.shape}, 范数均值={item_emb.norm(dim=1).mean():.4f}")
-            print(f"  mm_emb     : shape={mm_emb.shape}, 范数均值={mm_emb.norm(dim=1).mean():.4f}")
-            print(f"  融合后     : shape={item_emb_out.shape}, 范数均值={item_emb_out.norm(dim=1).mean():.4f}")
-            _id_term = item_emb[0].detach().cpu()
-            _mm_term = mm_normed[0].detach().cpu()
-            print(f"  --- item 0 融合前两项 ---")
-            print(f"  第1项 ID embedding (item_emb[0])        : 范数={_id_term.norm():.4f}, 前10维={_id_term[:10].tolist()}")
-            print(f"  第2项 多模态项 (mm_normed[0])            : 范数={_mm_term.norm():.4f}, 前10维={_mm_term[:10].tolist()}")
-            print(f"  两项之比 (多模态范数/ID范数)             : {_mm_term.norm() / (_id_term.norm() + 1e-8):.4f}")
+            print(f"[MM] _fuse_multimodal 第{self._fuse_debug_counter}次调用:")
+            print(f"  alpha={self.alpha.item():.4f}, beta={self.beta.item():.4f}")
+            if self.t_feat is not None:
+                print(f"  t_proj 输出范数均值={t_emb.norm(dim=1).mean():.4f}")
+            if self.v_feat is not None:
+                print(f"  v_proj 输出范数均值={v_emb.norm(dim=1).mean():.4f}")
+            print(f"  mm_normed 范数均值={mm_normed.norm(dim=1).mean():.4f}")
+            print(f"  融合后 item_emb 范数均值={item_emb_out.norm(dim=1).mean():.4f}")
             self._fuse_debug_counter += 1
         
         return item_emb_out
