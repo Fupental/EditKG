@@ -278,19 +278,21 @@ if __name__ == '__main__':
     ===== EditKG 主训练入口 =====
     对应论文 Algorithm 1
     """
-    # 固定随机种子（默认注释掉，需要时取消注释以保证可复现性）
-    # seed = 1998
-    # random.seed(seed)
-    # np.random.seed(seed)
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-  
     # ===== 1. 读取命令行参数 =====
     global args, device, train_user_set, kg_dict, item_lists_dict, ent_lists_dict
     args = parse_args()
     device = torch.device("cuda:" + str(args.gpu_id)) if args.cuda else torch.device("cpu")
+
+    # 固定随机种子（用于显著性检验的多次实验）
+    if args.seed is not None:
+        seed = args.seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[SEED] 随机种子已设置为 {seed}")
 
     # ===== 2. 加载数据 =====
     # train_cf: 训练交互对 [N, 2]
@@ -303,6 +305,12 @@ if __name__ == '__main__':
     # triplets: 所有KG三元组 [N, 3]
     # kg_dict: {head: [(tail, relation), ...]} 邻接字典
     train_cf, test_cf, user_dict, n_params, graph, ui_sparse_graph, all_sparse_graph, item_rel_mask, triplets, kg_dict, v_feat, t_feat = load_data(args)
+
+    # 如果指定 --no_mm，禁用多模态特征（作为基线对照）
+    if args.no_mm:
+        v_feat = None
+        t_feat = None
+        print("[NO_MM] 已禁用多模态特征（基线模式）")
 
     # ===== 3. 计算物品间 NPMI（论文 Section 3.1, Eq.1）=====
     # NPMI(i,j) 衡量物品 i 和 j 的共现关联强度
@@ -455,7 +463,7 @@ if __name__ == '__main__':
             # 如果 Recall@20 连续10轮评估没有提升，则停止训练
             cur_best, stopping_step, should_stop = early_stopping(ret['recall'][0], cur_best,
                                                                         stopping_step, expected_order='acc',
-                                                                        flag_step=10)
+                                                                        flag_step=2)
             
             if should_stop:
                 break
@@ -465,3 +473,33 @@ if __name__ == '__main__':
                 torch.save(model.state_dict(), args.out_dir + 'model_' + args.dataset + '.ckpt')
             
     print('early stopping at %d, recall@20:%.4f' % (epoch, cur_best))
+
+    # ===== 显存峰值统计 =====
+    if torch.cuda.is_available():
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_mb = peak_mem_bytes / (1024 ** 2)
+        peak_mem_gb = peak_mem_bytes / (1024 ** 3)
+        print(f'[GPU Memory] 训练期间显存峰值: {peak_mem_mb:.1f} MB ({peak_mem_gb:.2f} GB)')
+        print(f'[GPU Memory] 最低显卡显存需求 (建议预留约20%余量): {peak_mem_gb * 1.2:.2f} GB')
+
+    # ===== 输出 JSON 格式结果（便于显著性检验脚本解析）=====
+    import json
+    result_summary = {
+        'seed': args.seed,
+        'no_mm': args.no_mm,
+        'best_recall_20': float(best_metric['recall']),
+        'best_ndcg_20': float(best_metric['ndcg']),
+        'best_precision_20': float(best_metric['precision']),
+        'best_hit_ratio_20': float(best_metric['hit_ratio']),
+        'best_epoch': best_epoch,
+        'early_stop_epoch': epoch
+    }
+    print('\n[RESULT_JSON]' + json.dumps(result_summary))
+
+    # 追加写入结果文件
+    mode_tag = 'baseline' if args.no_mm else 'mm_text'
+    result_file = f'./result/{args.dataset}_significance_{mode_tag}.jsonl'
+    os.makedirs('./result', exist_ok=True)
+    with open(result_file, 'a') as f:
+        f.write(json.dumps(result_summary) + '\n')
+    print(f'[RESULT] 结果已追加到 {result_file}')

@@ -882,30 +882,41 @@ class Recommender(nn.Module):
         self._init_loss_function()   # 初始化损失函数
         self.gcn = self._init_model()  # 创建 GraphConv 模块
 
-        # ===== 多模态特征融合模块（参考 R2MR 的 PCA 降维 + 加权融合方式）=====
-        # 特征已在 data_loader 中通过 PCA 降维到 384 维（= dim*3 = 128*3），
-        # 无需额外 MLP 投影，可直接与 ID 嵌入相加
+        # ===== 双通道多模态融合模块（仿照 R2MR 的双通道架构）=====
+        # 文本通道和图像通道各自独立：
+        #   物品嵌入 = s * modal_feat + (1-s) * id_emb   (可学习加权)
+        #   用户嵌入 = 独立的 preference 参数
+        # 两通道各自经过 LightGCN 聚合后拼接为最终表示
         self.use_multimodal = (v_feat is not None) or (t_feat is not None)
+        
         if v_feat is not None:
-            self.v_feat = nn.Parameter(torch.FloatTensor(v_feat))  # [n_items, 384] 可训练
-            print(f"[MM-DEBUG] v_feat 设为可训练参数, shape={self.v_feat.shape}, "
-                  f"范数均值={self.v_feat.norm(dim=1).mean():.4f}")
+            self.v_feat = nn.Parameter(torch.FloatTensor(v_feat))  # [n_items, 384]
+            # s_v: 图像特征的融合权重（经 sigmoid 映射到 [0,1]）
+            self.s_v = nn.Parameter(torch.tensor(0.0))  # 初始 sigmoid(0)=0.5
+            print(f"[MM] 图像通道已启用: v_feat shape={self.v_feat.shape}")
         else:
             self.v_feat = None
-            print(f"[MM-DEBUG] v_feat = None")
+            print(f"[MM] 图像通道未启用 (v_feat=None)")
 
         if t_feat is not None:
-            self.t_feat = nn.Parameter(torch.FloatTensor(t_feat))  # [n_items, 384] 可训练
-            print(f"[MM-DEBUG] t_feat 设为可训练参数, shape={self.t_feat.shape}, "
-                  f"范数均值={self.t_feat.norm(dim=1).mean():.4f}")
+            self.t_feat = nn.Parameter(torch.FloatTensor(t_feat))  # [n_items, 384]
+            # s_t: 文本特征的融合权重（经 sigmoid 映射到 [0,1]）
+            self.s_t = nn.Parameter(torch.tensor(0.0))  # 初始 sigmoid(0)=0.5
+            print(f"[MM] 文本通道已启用: t_feat shape={self.t_feat.shape}")
         else:
             self.t_feat = None
-            print(f"[MM-DEBUG] t_feat = None")
+            print(f"[MM] 文本通道未启用 (t_feat=None)")
 
         if self.use_multimodal:
-            print(f"[MM-DEBUG] use_multimodal=True, 多模态嵌入可训练，无门控")
+            # 双通道 CF 聚合器（复用 Aggregator，1 层 LightGCN）
+            self.mm_agg = Aggregator(
+                n_users=self.n_users, n_items=self.n_items,
+                n_entity=self.n_entities, n_relation=self.n_relations,
+                gamma=self.gamma, max_iter=self.max_iter
+            ).to(self.device)
+            print(f"[MM] 双通道架构已就绪，最终维度将从 {self.emb_size*3} 变为 {self.emb_size*3*2}")
         else:
-            print(f"[MM-DEBUG] use_multimodal=False, 不使用多模态")
+            print(f"[MM] 不使用多模态，维度保持 {self.emb_size*3}")
 
         
         
@@ -1004,55 +1015,78 @@ class Recommender(nn.Module):
 
         return cl_loss
 
-    def _fuse_multimodal(self, item_emb):
+    def _build_mm_channels(self, user_all_emb, item_all_emb):
         """
-        ★ 多模态特征融合 ★
+        ★ 双通道多模态融合（仿照 R2MR）★
         
-        特征已通过 PCA 降到 384 维（= dim*3 = 128*3），
-        与 ID 嵌入维度完全一致，直接相加，无需 MLP 投影或门控。
-        多模态嵌入（v_feat / t_feat）为可训练 nn.Parameter。
+        每个模态通道内部：
+            物品侧: item_ch = s * modal_feat + (1-s) * item_id_emb
+            用户侧: user_ch = modal_preference (独立可学习参数)
+            各自经过 1 层 LightGCN 聚合 + 残差连接
         
-        融合公式：
-            item_emb_final = item_emb + normalize(v_feat + t_feat)
+        最终将所有通道拼接：
+            item_final = cat([ch1_item, ch2_item, ...])
+            user_final = cat([ch1_user, ch2_user, ...])
         
         参数:
-            item_emb: GCN 输出的物品 ID 嵌入 [n_items, dim*3=384]
+            user_all_emb: GCN 输出的用户嵌入 [n_users, 384]
+            item_all_emb: GCN 输出的物品嵌入 [n_items, 384]
         
         返回:
-            融合后的物品嵌入 [n_items, dim*3=384]
+            user_final: [n_users, 384 * n_channels]
+            item_final: [n_items, 384 * n_channels]
         """
         if not self.use_multimodal:
-            return item_emb
+            return user_all_emb, item_all_emb
         
-        mm_emb = torch.zeros_like(item_emb)
+        user_channels = []
+        item_channels = []
         
-        if self.v_feat is not None:
-            mm_emb = mm_emb + self.v_feat
-        
+        # --- 文本通道 ---
         if self.t_feat is not None:
-            mm_emb = mm_emb + self.t_feat
+            s_t = torch.sigmoid(self.s_t)
+            # 物品文本通道嵌入 = 文本特征 * s_t + ID嵌入(含CF+KG) * (1 - s_t)
+            t_item_emb = s_t * self.t_feat + (1 - s_t) * item_all_emb  # [n_items, 384]
+            # 用户侧直接使用 GraphConv 输出的 user_all_emb（含CF+KG信息）
+            # LightGCN 聚合：用户聚合物品、物品聚合用户
+            t_user_agg, t_item_agg = self.mm_agg(user_all_emb, t_item_emb, self.interact_mat)
+            # 残差连接
+            t_user_out = user_all_emb + F.normalize(t_user_agg)
+            t_item_out = t_item_emb + F.normalize(t_item_agg)
+            user_channels.append(t_user_out)
+            item_channels.append(t_item_out)
         
-        # 直接相加，无门控，多模态嵌入本身可训练
-        mm_normed = F.normalize(mm_emb)
-        item_emb_out = item_emb + mm_normed
-
-        # 调试打印
-        if not hasattr(self, '_fuse_debug_counter'):
-            self._fuse_debug_counter = 0
-        if self._fuse_debug_counter < 3:
-            print(f"[MM-DEBUG] _fuse_multimodal 第{self._fuse_debug_counter}次调用:")
-            print(f"  item_emb   : shape={item_emb.shape}, 范数均值={item_emb.norm(dim=1).mean():.4f}")
-            print(f"  mm_emb     : shape={mm_emb.shape}, 范数均值={mm_emb.norm(dim=1).mean():.4f}")
-            print(f"  融合后     : shape={item_emb_out.shape}, 范数均值={item_emb_out.norm(dim=1).mean():.4f}")
-            _id_term = item_emb[0].detach().cpu()
-            _mm_term = mm_normed[0].detach().cpu()
-            print(f"  --- item 0 融合前两项 ---")
-            print(f"  第1项 ID embedding (item_emb[0])        : 范数={_id_term.norm():.4f}, 前10维={_id_term[:10].tolist()}")
-            print(f"  第2项 多模态项 (mm_normed[0])            : 范数={_mm_term.norm():.4f}, 前10维={_mm_term[:10].tolist()}")
-            print(f"  两项之比 (多模态范数/ID范数)             : {_mm_term.norm() / (_id_term.norm() + 1e-8):.4f}")
-            self._fuse_debug_counter += 1
+        # --- 图像通道 ---
+        if self.v_feat is not None:
+            s_v = torch.sigmoid(self.s_v)
+            # 物品图像通道嵌入 = 图像特征 * s_v + ID嵌入(含CF+KG) * (1 - s_v)
+            v_item_emb = s_v * self.v_feat + (1 - s_v) * item_all_emb  # [n_items, 384]
+            # 用户侧直接使用 GraphConv 输出的 user_all_emb（含CF+KG信息）
+            # LightGCN 聚合
+            v_user_agg, v_item_agg = self.mm_agg(user_all_emb, v_item_emb, self.interact_mat)
+            # 残差连接
+            v_user_out = user_all_emb + F.normalize(v_user_agg)
+            v_item_out = v_item_emb + F.normalize(v_item_agg)
+            user_channels.append(v_user_out)
+            item_channels.append(v_item_out)
         
-        return item_emb_out
+        # 拼接所有通道
+        user_final = torch.cat(user_channels, dim=-1)
+        item_final = torch.cat(item_channels, dim=-1)
+        
+        # 调试打印（只打印前3次）
+        if not hasattr(self, '_mm_debug_counter'):
+            self._mm_debug_counter = 0
+        if self._mm_debug_counter < 3:
+            print(f"[MM] _build_mm_channels 第{self._mm_debug_counter}次调用:")
+            if self.t_feat is not None:
+                print(f"  文本通道: s_t={torch.sigmoid(self.s_t).item():.4f}")
+            if self.v_feat is not None:
+                print(f"  图像通道: s_v={torch.sigmoid(self.s_v).item():.4f}")
+            print(f"  user_final: shape={user_final.shape}, item_final: shape={item_final.shape}")
+            self._mm_debug_counter += 1
+        
+        return user_final, item_final
 
     def gcn_forword(self, user, pos_item):#前向传播并计算损失函数
         """
@@ -1084,25 +1118,21 @@ class Recommender(nn.Module):
                                                             node_dropout=self.node_dropout,
                                                             gumbel=True)
 
-        # ★ 多模态融合：将视觉/文本特征投影后加到物品嵌入上 ★
-        # 参考 R2MR 的融合方式：MLP投影 + 加权融合
-        item_all_emb = self._fuse_multimodal(item_all_emb)
+        # ★ 双通道多模态融合（仿照 R2MR）★
+        # 将 GCN 输出的 ID 嵌入与多模态特征分通道融合，各自 GCN 聚合后拼接
+        user_final, item_final = self._build_mm_channels(user_all_emb, item_all_emb)
 
-        # 取当前批次用户的嵌入（花式索引：用用户ID列表从所有用户嵌入中取对应行）
-        user_emb = user_all_emb[user]  # [batch_size, dim*3]
-        # ★ torch.matmul(A, B): 矩阵乘法 ★
-        # .transpose(1, 0): 转置矩阵（行变列，列变行）
-        # user_emb[batch_size, dim*3] × item_all_emb.T[dim*3, n_items]
-        # = score[batch_size, n_items]
-        # 含义：每个用户对每个物品的"内积评分"（越大越可能推荐）
-        score = torch.matmul(user_emb, item_all_emb.transpose(1, 0))
+        # 取当前批次用户的嵌入
+        user_emb = user_final[user]  # [batch_size, dim_final]
+        # 内积打分：user_emb × item_final^T → [batch_size, n_items]
+        score = torch.matmul(user_emb, item_final.transpose(1, 0))
         # 交叉熵损失：把推荐看作"n_items类的分类问题"
         # score 是预测的分数，pos_item 是"正确答案"（用户实际交互的物品ID）
         # CrossEntropyLoss 内部会对score做softmax再取-log
         cet_loss = self.cet_loss(score, pos_item)
         
         # L2正则化（当前注释掉了，未加入损失）
-        pos_emb = item_all_emb[pos_item]
+        pos_emb = item_final[pos_item]
         regularizer = (torch.norm(user_emb) ** 2
                        + torch.norm(pos_emb) ** 2)
  
@@ -1160,15 +1190,13 @@ class Recommender(nn.Module):
                                                             node_dropout=False,
                                                             gumbel=False)           # 推理时关闭Gumbel
 
-        # ★ 推理时也需要融合多模态特征 ★
-        item_all_emb = self._fuse_multimodal(item_all_emb)
+        # ★ 推理时也需要双通道多模态融合 ★
+        user_final, item_final = self._build_mm_channels(user_all_emb, item_all_emb)
 
-        item_pred_emb = item_all_emb 
-        user_pred_emb = user_all_emb 
         if for_kgc:
-            return item_pred_emb, KG_drop_hard
+            return item_all_emb, KG_drop_hard  # KGC分析用原始384维嵌入
         else:
-            return item_pred_emb, user_pred_emb
+            return item_final, user_final
 
 
     def rating(self, u_g_embeddings, i_g_embeddings, type="bpr"):

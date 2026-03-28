@@ -94,4 +94,8 @@ def parse_args():
     parser.add_argument("--mm_debug", action="store_true", help="打印多模态特征加载和融合的调试信息")
     parser.add_argument("--quick_test", action="store_true", help="快速测试模式：仅跑2轮，验证代码能否跑通")
 
+    # ===== 显著性检验参数 ===== #
+    parser.add_argument("--seed", type=int, default=None, help="随机种子（用于显著性检验的多次实验）")
+    parser.add_argument("--no_mm", action="store_true", help="禁用多模态特征（作为基线对照）")
+
     return parser.parse_args()

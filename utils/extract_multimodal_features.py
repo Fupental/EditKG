@@ -191,24 +191,29 @@ def extract_text_features(item_texts, n_items, device, max_len=64, batch_size=12
     return text_feat
 
 
-def extract_image_features(item_image_urls, n_items, device, batch_size=64):
+def _download_single_image(args_tuple):
+    """下载单张图片并返回 (item_id, image_bytes) 或 (item_id, None)。"""
+    import requests
+    iid, url = args_tuple
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        return (iid, response.content)
+    except Exception:
+        return (iid, None)
+
+
+def extract_image_features(item_image_urls, n_items, device, batch_size=64, num_workers=24):
     """
     使用 ViT (vit_base_patch16_224) 提取图像特征。
-    
-    参考 R2MR 的视觉编码方式 (common/vit.py):
-    - 使用 Vision Transformer 编码图像
-    - 提取最终层的特征表示
-    
-    流程：
-    1. 按批次下载图片（从 URL）
-    2. 预处理为 224x224
-    3. 通过 ViT 提取特征（取 forward_features 的全局平均池化输出）
+    多线程并发下载图片，批量 ViT 编码。
     
     参数:
         item_image_urls: {item_id: url_str}
         n_items: 物品总数
         device: torch.device
-        batch_size: 批次大小
+        batch_size: ViT 编码批次大小
+        num_workers: 并发下载线程数
     
     返回:
         image_feat: [n_items, 768] numpy 数组
@@ -217,8 +222,8 @@ def extract_image_features(item_image_urls, n_items, device, batch_size=64):
     from timm.data import resolve_data_config
     from timm.data.transforms_factory import create_transform
     from PIL import Image
-    import requests
     from io import BytesIO
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     print("\n========== 图像特征提取 (ViT) ==========")
     print("加载 ViT 模型 (vit_base_patch16_224)...")
@@ -236,31 +241,45 @@ def extract_image_features(item_image_urls, n_items, device, batch_size=64):
     item_ids = sorted(item_image_urls.keys())
     total = len(item_ids)
     print(f"待编码物品数: {total}/{n_items}")
-    
+    print(f"并发下载线程数: {num_workers}")
+
     success_count = 0
     fail_count = 0
 
     with torch.no_grad():
         for start in tqdm(range(0, total, batch_size), desc="ViT 编码图片"):
             batch_ids = item_ids[start:start + batch_size]
+
+            # ---- 多线程并发下载本批次图片 ----
+            download_args = [(iid, item_image_urls[iid]) for iid in batch_ids]
+            downloaded = {}  # iid -> bytes
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(_download_single_image, arg): arg[0]
+                           for arg in download_args}
+                for future in as_completed(futures):
+                    iid, content = future.result()
+                    if content is not None:
+                        downloaded[iid] = content
+
+            # ---- 解码 + 预处理 ----
             batch_images = []
             valid_ids = []
-            
             for iid in batch_ids:
-                url = item_image_urls[iid]
+                if iid not in downloaded:
+                    fail_count += 1
+                    if fail_count <= 10:
+                        print(f"  [图片失败] item_id={iid}: 下载失败")
+                    continue
                 try:
-                    response = requests.get(url, timeout=10)
-                    response.raise_for_status()
-                    img = Image.open(BytesIO(response.content)).convert('RGB')
+                    img = Image.open(BytesIO(downloaded[iid])).convert('RGB')
                     img_tensor = transform(img)
                     batch_images.append(img_tensor)
                     valid_ids.append(iid)
                     success_count += 1
                 except Exception as e:
                     fail_count += 1
-                    if fail_count <= 10:  # 只打印前10个失败原因，避免刷屏
+                    if fail_count <= 10:
                         print(f"  [图片失败] item_id={iid}: {type(e).__name__}: {e}")
-                    continue
 
             if not batch_images:
                 continue
@@ -283,8 +302,10 @@ def main():
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID")
     parser.add_argument("--text_batch_size", type=int, default=128, help="文本编码批次大小")
     parser.add_argument("--image_batch_size", type=int, default=32, help="图像编码批次大小")
+    parser.add_argument("--num_workers", type=int, default=24, help="图像下载并发线程数")
     parser.add_argument("--max_text_len", type=int, default=64, help="最大文本长度")
     parser.add_argument("--skip_images", action="store_true", help="跳过图像特征提取（仅提取文本）")
+    parser.add_argument("--force_reextract", action="store_true", help="强制重新提取，忽略已有的 .npy 文件")
     parser.add_argument("--debug", action="store_true", help="调试模式：只处理少量样本，打印详细信息")
     parser.add_argument("--debug_samples", type=int, default=5, help="调试模式下每种模态处理的样本数")
     args = parser.parse_args()
@@ -321,11 +342,18 @@ def main():
             print(f"  item_id={iid}: {item_image_urls[iid][:120]}")
 
     # Step 3: 提取文本特征 (BERT)
-    text_feat = extract_text_features(
-        item_texts, n_items, device,
-        max_len=args.max_text_len,
-        batch_size=args.text_batch_size
-    )
+    text_feat_path = os.path.join(data_dir, 'text_feat.npy')
+    if not args.force_reextract and os.path.isfile(text_feat_path):
+        text_feat = np.load(text_feat_path, allow_pickle=True)
+        print(f"\n[跳过] 文本特征已存在: {text_feat_path}, 形状: {text_feat.shape}（使用 --force_reextract 强制重新提取）")
+    else:
+        text_feat = extract_text_features(
+            item_texts, n_items, device,
+            max_len=args.max_text_len,
+            batch_size=args.text_batch_size
+        )
+        np.save(text_feat_path, text_feat)
+        print(f"✓ 文本特征已保存: {text_feat_path}")
 
     if args.debug:
         print(f"\n[DEBUG] ===== BERT 文本特征质量检查 =====")
@@ -337,16 +365,20 @@ def main():
             print(f"    前10维: {emb[:10]}")
         nonzero_cnt = np.sum(np.any(text_feat != 0, axis=1))
         print(f"  有效文本特征行数: {nonzero_cnt}/{n_items}")
-    text_feat_path = os.path.join(data_dir, 'text_feat.npy')
-    np.save(text_feat_path, text_feat)
-    print(f"✓ 文本特征已保存: {text_feat_path}")
-
     # Step 4: 提取图像特征 (ViT)
+    image_feat_path = os.path.join(data_dir, 'image_feat.npy')
     if not args.skip_images:
-        image_feat = extract_image_features(
-            item_image_urls, n_items, device,
-            batch_size=args.image_batch_size
-        )
+        if not args.force_reextract and os.path.isfile(image_feat_path):
+            image_feat = np.load(image_feat_path, allow_pickle=True)
+            print(f"\n[跳过] 图像特征已存在: {image_feat_path}, 形状: {image_feat.shape}（使用 --force_reextract 强制重新提取）")
+        else:
+            image_feat = extract_image_features(
+                item_image_urls, n_items, device,
+                batch_size=args.image_batch_size,
+                num_workers=args.num_workers
+            )
+            np.save(image_feat_path, image_feat)
+            print(f"✓ 图像特征已保存: {image_feat_path}")
 
         if args.debug:
             print(f"\n[DEBUG] ===== ViT 图像特征质量检查 =====")
@@ -359,9 +391,7 @@ def main():
             nonzero_cnt = np.sum(np.any(image_feat != 0, axis=1))
             print(f"  有效图像特征行数: {nonzero_cnt}/{n_items}")
 
-        image_feat_path = os.path.join(data_dir, 'image_feat.npy')
-        np.save(image_feat_path, image_feat)
-        print(f"✓ 图像特征已保存: {image_feat_path}")
+
     else:
         print("已跳过图像特征提取")
 
