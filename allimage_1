@@ -1,5 +1,3 @@
-git commit -m "回退到双通道方案之前：简单加法融合(_fuse_multimodal)，含v_feat/t_feat可训练参数、多线程图像下载、PCA+tanh预处理、skip逻辑" 2>&1    
-              
                         all_embed [n_nodes, 384]
                         (Xavier 随机初始化, nn.Parameter)
                                     │
@@ -36,63 +34,63 @@ git commit -m "回退到双通道方案之前：简单加法融合(_fuse_multimo
                     │    │+ 残差     │ │+ 残差     │
                     │    └─────┬─────┘ └───┬──────┘
                     │          │           │
-                    │    entity_emb_res  n_entity_emb_res
-                    │    [n_i, 128]      [n_i, 128]
-                    │          │           │
                ╔════╧══════════╧═══════════╧══════════════╗
-               ║  第⑤步: cat([①, ②, ③], dim=-1)           ║
+               ║  cat([①CF, ②P-KG聚合, ③N-KG聚合], dim=-1)║
                ║  item_embeds = [24915, 384]               ║
-               ║  (到此为止 LightGCN 还没出场)              ║
                ╚═══════════════════╤══════════════════════╝
                                    │
                ╔═══════════════════╧══════════════════════╗
-               ║  第⑥步: ★ LightGCN 1层 CF聚合 ★          ║
-               ║                                          ║
-               ║  user_embeds [70679,384]                  ║
-               ║  item_embeds [24915,384]                  ║
-               ║       │              │                    ║
+               ║  ★ LightGCN 1层 CF聚合 ★                 ║
                ║  user_agg = A_ui × item_embeds (物品→用户)║
                ║  item_agg = A_iu × user_embeds (用户→物品)║
-               ║       │              │                    ║
-               ║  user_res += norm(user_agg)               ║
-               ║  item_res += norm(item_agg)               ║
+               ║  + 残差连接                                ║
                ╚════════╤═════════════╤═══════════════════╝
                         │             │
                user_all_emb      item_all_emb
                [70679, 384]      [24915, 384]
                         │             │
                ╔════════╧═════════════╧═══════════════════╗
-               ║          GraphConv.forward() 结束         ║
+               ║        GraphConv.forward() 结束           ║
                ╚════════╤═════════════╤═══════════════════╝
                         │             │
                         │             ▼
-                        │   ┌─────────────────────┐
-                        │   │ _fuse_multimodal()   │
-                        │   │                     │
-                        │   │  t_feat [n_i, 384]  │
-                        │   │       +             │
-                        │   │  v_feat [n_i, 384]  │
-                        │   │       ↓             │
-                        │   │  normalize(mm_emb)  │
-                        │   │       ↓             │
-                        │   │  item_all_emb       │
-                        │   │    += mm_normed     │
-                        │   └────────┬────────────┘
-                        │            │
-                        │       item_all_emb
-                        │       [24915, 384]
-                        │       (含多模态信息)
-                        │            │
-               ╔════════╧════════════╧════════════════════╗
+                        │   ┌──────────────────────────┐
+                        │   │  ★ 方案A: 独立投影+权重 ★  │
+                        │   │   _fuse_multimodal()      │
+                        │   │                          │
+  t_feat [n_i,384] ─────┼──►│  text_proj(t_feat)       │
+  (BERT→PCA→tanh)       │   │   → t_emb [n_i, 384]    │
+  nn.Parameter           │   │                          │
+                        │   │  image_proj(v_feat)      │
+  v_feat [n_i,384] ─────┼──►│   → v_emb [n_i, 384]    │
+  (ViT→PCA→tanh)        │   │                          │
+  nn.Parameter           │   │  mm = α·t_emb + β·v_emb │
+                        │   │  (α,β 可学习标量)         │
+                        │   │                          │
+                        │   │  item_all_emb            │
+                        │   │   += normalize(mm)       │
+                        │   └────────────┬─────────────┘
+                        │                │
+                        │           item_final
+                        │           [24915, 384]
+                        │                │
+               ╔════════╧════════════════╧════════════════╗
                ║              最终打分                      ║
                ║                                          ║
                ║  user_emb = user_all_emb[batch]  [B,384] ║
-               ║  score = user_emb @ item_all_emb.T       ║
+               ║  score = user_emb @ item_final.T         ║
                ║        → [B, n_items]                    ║
                ║                                          ║
                ║  loss = CrossEntropy(score, pos_item)    ║
                ╚══════════════════════════════════════════╝
 
 
-时间线: ①②③拆分 → KG聚合(scatter_sum) → 拼回384
-        → LightGCN(1层) → 融合t_feat+v_feat → 打分
+与之前的区别（只有融合模块变了）:
+
+  之前:  v_feat + t_feat → normalize → 加到item_emb
+         (不同语义空间直接相加)
+
+  现在:  text_proj(t_feat)  ──┐
+                              ├→ α·t_emb + β·v_emb → normalize → 加到item_emb
+         image_proj(v_feat) ──┘
+         (各自投影到共享空间，再可学习加权)
