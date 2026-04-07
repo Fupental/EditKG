@@ -40,7 +40,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # [已删除] KGR模型不再使用
 from modules.EDKG import Recommender       # 核心推荐模型
-from modules.llm_scorer import LLMScorer   # LLM三元组评分器（替代KGC教师）
+# [已删除] PCGrad — MMD已删除，无需梯度冲突处理
 
 from utils.evaluate import test            # 多进程评估函数
 from utils.helper import early_stopping, _generate_candi_kg, _cal_npmi
@@ -166,20 +166,16 @@ if __name__ == '__main__':
     # ===== 5. 创建模型 =====
     model = Recommender(n_params, args, graph, ui_sparse_graph, item_rel_mask, v_feat=v_feat, t_feat=t_feat).to(device)
 
-    # ===== 5.5 初始化LLM评分器（替代KGC教师）=====
-    llm_scorer = None
-    if args.llm_model_path:
-        data_dir = os.path.join(args.data_path, args.dataset)
-        llm_scorer = LLMScorer(
-            model_path=args.llm_model_path,
-            adapter_path=args.llm_adapter_path,
-            data_dir=data_dir,
-            device=f"cuda:{args.gpu_id}",
-            batch_size=args.llm_batch_size,
-        )
-        print(f"[LLM] LLM评分器已就绪")
+    # ===== 5.5 加载LLM预计算掩码（可选） =====
+    if args.llm_mask_path:
+        import json
+        print(f"[LLM] 加载LLM掩码: {args.llm_mask_path}")
+        llm_mask = torch.FloatTensor(np.load(args.llm_mask_path))
+        model.gcn.set_llm_mask('primary', llm_mask.to(device))
+        print(f"[LLM] Primary KG LLM掩码已加载, shape={llm_mask.shape}, "
+              f"保留率={llm_mask.mean():.4f}")
     else:
-        print("[LLM] 未指定--llm_model_path，跳过LLM教师蒸馏（mmd_loss=0）")
+        print("[LLM] 未指定LLM掩码路径，跳过LLM虚假三元组筛选")
 
     # ===== 6. 创建优化器 =====
     # 主优化器：Adam
@@ -238,14 +234,6 @@ if __name__ == '__main__':
             all_candi_kg = torch.LongTensor(all_candi_kg).to(device)
             model.gcn._update_knowledge(all_candi_kg)
             
-            # Step 5: ★ LLM教师预计算 Potential KG 所有三元组的真实性分数 ★
-            # 替代原来的KGC在线训练+推理，LLM只需推理一次，结果缓存供后续每batch查表
-            if llm_scorer is not None:
-                print(f"[LLM] 对 {len(all_candi_kg)} 条候选三元组进行真实性评分...")
-                llm_scores = llm_scorer.score_triplets(all_candi_kg, target_device=device)
-                model.gcn.set_llm_scores(llm_scores)
-                print(f"[LLM] 分数已缓存, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
-            
         # ----- CF推荐训练 -----
         # 对应论文 Section 3.3 + Section 3.4
         model.train()
@@ -261,15 +249,13 @@ if __name__ == '__main__':
             batch['users'] = all_feed_data['users'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
             batch['pos_items'] = all_feed_data['pos_items'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
 
-            # 前向传播：返回 (推荐损失, MMD蒸馏损失)
-            cet_loss, mmd_loss = model(batch)
+            # 前向传播：返回 (推荐损失, _)
+            batch_loss, _ = model(batch)
             
-            # 总损失 = 推荐损失 + MMD蒸馏损失（LLM教师→APL学生）
-            batch_loss = cet_loss + mmd_loss
-            
+            # 标准反向传播（MMD已删除，无需PCGrad）
             optimizer.zero_grad()
             batch_loss.backward()
-            optimizer.step()
+            optimizer.step()  # 根据梯度更新模型参数
             loss += batch_loss.item()
 
         train_e_t = time()

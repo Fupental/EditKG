@@ -6,10 +6,10 @@
 整体流程概览:
     1. 加载数据（用户-物品交互、知识图谱三元组）
     2. 计算物品间 NPMI 相关性（Section 3.1, Eq.1）
-    3. 创建 Recommender 模型 + Adam 优化器
+    3. 创建 Recommender 模型 + PCGrad 优化器
     4. 100 轮训练循环:
-       - 每3轮: 生成候选KG → 更新Potential KG
-       - 每轮: CF推荐训练（交叉熵损失）
+       - 每3轮: 生成候选KG → 训练KGC模型 → 更新Potential KG
+       - 每轮: CF训练（PCGrad处理MMD和推荐损失的梯度冲突）
        - 每轮: 评估 Recall/NDCG/Precision/Hit@K
     5. 早停策略保存最优模型
 
@@ -34,13 +34,13 @@ from collections import Counter, defaultdict
 
 from utils.parser import parse_args
 from prettytable import PrettyTable
-# [已删除] accuracy_score — KGC验证不再需要
+from sklearn.metrics import accuracy_score
 from utils.data_loader import load_data
 from sklearn.metrics.pairwise import cosine_similarity
 
-# [已删除] KGR模型不再使用
+from modules.KGR_model import KGR
 from modules.EDKG import Recommender       # 核心推荐模型
-from modules.llm_scorer import LLMScorer   # LLM三元组评分器（替代KGC教师）
+from modules.pcgrad import PCGrad          # 梯度冲突解决优化器
 
 from utils.evaluate import test            # 多进程评估函数
 from utils.helper import early_stopping, _generate_candi_kg, _cal_npmi
@@ -72,6 +72,171 @@ def get_feed_data(train_entity_pairs, train_user_set):
     feed_dict['pos_items'] = torch.LongTensor(entity_pairs[:, 1])
 
     return feed_dict
+
+def _mulp_neg(triplet):
+    """
+    为单个KG三元组生成一个负样本（多进程辅助函数）
+    
+    负采样策略（随机选择一种）：
+        - 33%概率: 替换关系r
+        - 33%概率: 替换头实体h  
+        - 33%概率: 替换尾实体t（尾实体从非物品实体中采样）
+    
+    参数:
+        triplet: [h, r, t] 原始三元组
+    
+    返回:
+        new_triplet: [h', r', t'] 负样本三元组
+    """
+    h, r, t = triplet
+    rand_value = random.random()
+    while True:
+        if rand_value < 0.33:
+            # 替换关系
+            new_rel = random.randint(1, n_relations - 1)
+            if new_rel != r:
+                new_triplet = [h, new_rel, t]
+                break
+        elif rand_value >= 0.33 and rand_value > 0.66:
+            # 替换头实体
+            new_head = random.randint(0, n_entities - 1)
+            if new_head != h:
+                new_triplet = [new_head, r, t]
+                break
+        else:
+            # 替换尾实体（从非物品实体中采样，避免将物品实体作为尾）
+            new_t = random.randint(n_items, n_entities - 1)
+            if new_t != t:
+                new_triplet = [h, r, new_t]
+                break
+    return new_triplet
+
+def _get_KGC_neg_data(triplets, neg_times=4):
+    """
+    为KGC训练生成负样本数据
+    
+    使用多进程并行生成，每个正三元组生成 neg_times 轮负样本。
+    最终去重返回所有唯一的负三元组。
+    
+    参数:
+        triplets: [N, 3] 正三元组数组
+        neg_times: 负采样轮次（默认4轮）
+    
+    返回:
+        去重后的负三元组 numpy 数组 [M, 3]
+    """
+    def negative_sampling(triplets):
+        pool = multiprocessing.Pool(cores)
+        neg_triplets = list(tqdm(iterable=pool.imap(_mulp_neg, triplets.tolist()), total=len(triplets)))
+        pool.close()
+        return np.array(neg_triplets)
+    all_neg = []
+    for i in range(min(neg_times, 2)):
+        neg_triplets = negative_sampling(triplets)
+        all_neg.append(neg_triplets)
+    return np.unique(np.concatenate(all_neg, axis=0), axis=0)
+
+
+def train_kgr_model(model, kgr_optimizer, triplets, kg_mask=[], epochs=2, threshold=0.5):
+    """
+    训练 KGC（知识图谱补全）模型
+    对应论文 Section 3.2.2 的 KGC 训练过程
+    
+    流程:
+        1. 如果有 KG 掩码（APL筛选结果），只保留被选中的三元组
+        2. 正样本标签=1，生成负样本标签=0
+        3. 按 epoch 循环训练:
+           - 每4轮重新采样负样本
+           - 前向传播计算 BCE 损失
+           - 反向传播更新模型参数
+           - 在验证集上计算准确率
+    
+    参数:
+        model: Recommender 模型（通过 model.gcn.kgc 访问KGC子模型）
+        kgr_optimizer: AdamW 优化器
+        triplets: [N, 3] 所有KG三元组
+        kg_mask: APL 的筛选掩码（非零=选中）
+        epochs: 训练轮次
+        threshold: 分类阈值（默认0.5）
+    """
+    # 如果有KG掩码，只保留被APL选中的三元组
+    if kg_mask != []:
+        triplets = triplets[kg_mask.reshape(-1) != 0.]
+
+    kgr_batch = 1024
+
+    # 构造正样本数据：三元组 + 标签1
+    pos_label = np.ones((triplets.shape[0], 1))
+    pos_data = np.concatenate([triplets, pos_label], axis=-1)
+    index = np.arange(len(pos_data))
+    np.random.shuffle(index)
+    pos_data = pos_data[index]
+
+    # 划分训练集和验证集（5%作为验证）
+    pos_valid_num = int(len(pos_data) * 0.05)
+    pos_train = pos_data[:-pos_valid_num]
+    pos_valid = pos_data[-pos_valid_num:]
+
+    model.train()
+    
+    for epoch in tqdm(range(epochs)):
+        torch.cuda.empty_cache()
+        # 每4轮重新生成负样本（避免重复使用相同负样本）
+        if epoch % 4 == 0:
+            kgc_neg_data = _get_KGC_neg_data(triplets, neg_times=4)
+            neg_label = np.zeros((kgc_neg_data.shape[0], 1))
+            neg_data = np.concatenate([kgc_neg_data, neg_label], axis=-1)
+            
+            neg_train = neg_data[:-pos_valid_num]
+            neg_valid = neg_data[-pos_valid_num:]
+            # 正负样本合并后打乱
+            kgr_train_data = np.concatenate([pos_train, neg_train], axis=0)
+            index = np.arange(len(kgr_train_data))
+            np.random.shuffle(index)
+            kgr_train_data = kgr_train_data[index]
+            kgr_valid_data = pos_valid  # 验证集只用正样本
+
+            kgr_train_data = torch.LongTensor(kgr_train_data)
+            kgr_valid_data = torch.LongTensor(kgr_valid_data)
+
+            kgr_iter = math.ceil(len(kgr_train_data) / kgr_batch)
+            kgr_val_iter = math.ceil(len(kgr_valid_data) / kgr_batch)
+
+        # ===== 训练循环 =====
+        batch_kg = dict()
+        total_kg_loss = 0
+        for i in range(kgr_iter):
+            batch_kg["hr_pair"] = kgr_train_data[i * kgr_batch:(i + 1) * kgr_batch].to(device)
+
+            # 通过 Recommender.forward(mode="kgc") 调用 KGC 模型
+            kgr_batch_loss = model(batch_kg, mode="kgc")
+            total_kg_loss += kgr_batch_loss.item()
+
+            kgr_optimizer.zero_grad()
+            kgr_batch_loss.backward()
+            kgr_optimizer.step()
+
+        # ===== 验证：计算分类准确率 =====
+        model.eval()
+        pred_label = []
+        true_label = []
+        for i in range(kgr_val_iter):
+            batch_kg["hr_pair"] = kgr_valid_data[i * kgr_batch:(i + 1) * kgr_batch].to(device)
+            pre = model.gcn.kgc(batch_kg, eval=True)   # 推理模式返回分数
+            pre = (pre >= threshold).squeeze(-1).float()  # 阈值分类
+            pre = pre.detach().cpu().numpy()
+            label = batch_kg["hr_pair"][:, -1]
+            label = label.cpu().numpy()
+            pred_label.append(pre)
+            true_label.append(label)
+            
+        pred_label = np.concatenate(pred_label, axis=0)
+        true_label = np.concatenate(true_label, axis=0)
+        
+        acc = accuracy_score(pred_label, true_label)  # 分类准确率（仅用于监控）
+
+        
+
 def _process_kg_attr(canditate_kg, tripltes, kg_mask=None):
     """
     扩展候选KG：将候选尾实体作为头实体的已有三元组也加入候选集
@@ -152,7 +317,7 @@ if __name__ == '__main__':
     item_pmi_dict = _cal_npmi(user_dict['train_user_set'])
     pkl.dump(item_pmi_dict, open(args.dataset + "item_pair_pmi.pkl", "wb"))
     
-    # 设置全局变量
+    # 设置全局变量（被 _mulp_neg 等多进程函数使用）
     n_users = n_params['n_users']
     n_items = n_params['n_items']
     n_entities = n_params['n_entities']
@@ -166,27 +331,13 @@ if __name__ == '__main__':
     # ===== 5. 创建模型 =====
     model = Recommender(n_params, args, graph, ui_sparse_graph, item_rel_mask, v_feat=v_feat, t_feat=t_feat).to(device)
 
-    # ===== 5.5 初始化LLM评分器（替代KGC教师）=====
-    llm_scorer = None
-    if args.llm_model_path:
-        data_dir = os.path.join(args.data_path, args.dataset)
-        llm_scorer = LLMScorer(
-            model_path=args.llm_model_path,
-            adapter_path=args.llm_adapter_path,
-            data_dir=data_dir,
-            device=f"cuda:{args.gpu_id}",
-            batch_size=args.llm_batch_size,
-        )
-        print(f"[LLM] LLM评分器已就绪")
-    else:
-        print("[LLM] 未指定--llm_model_path，跳过LLM教师蒸馏（mmd_loss=0）")
-
     # ===== 6. 创建优化器 =====
-    # 主优化器：Adam
+    # 主优化器：Adam + PCGrad（用于处理MMD和推荐损失的梯度冲突，论文 Section 3.4.1）
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    # [已删除] PCGrad包装 — 仅单一损失，使用标准Adam
+    optimizer = PCGrad(optimizer)
     
-    # [已删除] kgr_optimizer — KGC训练已移至LLM独立训练
+    # KGC专用优化器：AdamW（权重衰减版Adam）
+    kgr_optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)  
     
     # ===== 7. 训练状态初始化 =====
     cur_best = 0              # 当前最优 Recall@20
@@ -221,7 +372,7 @@ if __name__ == '__main__':
             all_feed_data['pos_index'] = torch.LongTensor(index)
 
         # ----- 每3轮：Knowledge Generator + Knowledge Deleter 更新 -----
-        # Knowledge Generator: 生成候选KG并更新Potential KG
+        # 对应论文 Section 3.1（候选KG生成）和 Section 3.2（KGC训练）
         if epoch % 3 == 0:
             # Step 1: 基于NPMI生成候选KG三元组（论文 Eq.2-4）
             # pmi_threshold=0.6: NPMI阈值（不同数据集需调整: yelp/MIND=0.7, others=0.5）
@@ -232,19 +383,17 @@ if __name__ == '__main__':
             # Step 2: 扩展候选KG（加入候选尾实体的属性三元组）
             all_candi_kg = _process_kg_attr(candi_kg, triplets)
             
-            # [已删除] KGC训练步骤 → LLM训练独立进行（MS-Swift）
+            # Step 3: 训练KGC模型（论文 Section 3.2.2, Eq.10-11）
+            # 第0轮训练10个epoch来预热，之后只训练1个epoch来微调
+            if epoch == 0:
+                kgr_epoch = 1 if args.quick_test else 10    # 预热轮次（MIND:6, others:8, book:10）
+            else:
+                kgr_epoch = 1     # 微调轮次（MIND:1, others:2）
+            train_kgr_model(model, kgr_optimizer, triplets, kg_mask=KG_mask, epochs=kgr_epoch)
             
             # Step 4: 将候选KG更新到模型中（作为 Potential KG）
             all_candi_kg = torch.LongTensor(all_candi_kg).to(device)
             model.gcn._update_knowledge(all_candi_kg)
-            
-            # Step 5: ★ LLM教师预计算 Potential KG 所有三元组的真实性分数 ★
-            # 替代原来的KGC在线训练+推理，LLM只需推理一次，结果缓存供后续每batch查表
-            if llm_scorer is not None:
-                print(f"[LLM] 对 {len(all_candi_kg)} 条候选三元组进行真实性评分...")
-                llm_scores = llm_scorer.score_triplets(all_candi_kg, target_device=device)
-                model.gcn.set_llm_scores(llm_scores)
-                print(f"[LLM] 分数已缓存, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
             
         # ----- CF推荐训练 -----
         # 对应论文 Section 3.3 + Section 3.4
@@ -254,6 +403,7 @@ if __name__ == '__main__':
 
         for i in tqdm(range(iter)):
             torch.cuda.empty_cache()
+            optimizer.zero_grad()
             
             # 构造当前批次
             batch = dict()
@@ -261,15 +411,15 @@ if __name__ == '__main__':
             batch['users'] = all_feed_data['users'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
             batch['pos_items'] = all_feed_data['pos_items'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
 
-            # 前向传播：返回 (推荐损失, MMD蒸馏损失)
-            cet_loss, mmd_loss = model(batch)
+            # 前向传播：返回 (推荐损失, MMD损失)
+            batch_loss, batch_mmd_loss = model(batch)
             
-            # 总损失 = 推荐损失 + MMD蒸馏损失（LLM教师→APL学生）
-            batch_loss = cet_loss + mmd_loss
-            
-            optimizer.zero_grad()
-            batch_loss.backward()
-            optimizer.step()
+            # ★ PCGrad 反向传播（论文 Section 3.4.1, Eq.25-28）★
+            # 先传辅助任务损失(MMD)，再传主任务损失(推荐)
+            # 如果梯度冲突，将辅助梯度投影到主梯度的法平面上
+            loss_list = [batch_mmd_loss, batch_loss]
+            optimizer.pc_backward(loss_list)
+            optimizer.step()#根据梯度更新模型参数
             loss += batch_loss.item()
 
         train_e_t = time()

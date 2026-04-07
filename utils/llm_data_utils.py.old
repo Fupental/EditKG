@@ -1,0 +1,333 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+llm_data_utils.py — LLM训练数据生成工具
+==========================================================================
+功能说明：
+    1. 解析实体/关系名称映射（Freebase MID → 可读名称）
+    2. 将KG三元组转为自然语言描述
+    3. 生成LLM微调训练数据（正样本 + 语义困难负样本）
+    4. 生成LLM推理数据，输出预计算掩码
+
+使用方式：
+    python utils/llm_data_utils.py --dataset amazon-book --output_dir data/amazon-book/llm_data/
+==========================================================================
+"""
+import os
+import json
+import random
+import argparse
+import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
+
+
+def load_entity_names(data_dir):
+    """
+    加载实体ID → 可读名称的映射
+
+    对于item实体（有ISBN），尝试从 isbn_to_title.json 获取书名。
+    对于非item实体（Freebase MID），直接使用MID作为名称。
+
+    返回:
+        entity_names: dict {remap_id: name_string}
+        item_ids: set of item remap_ids
+    """
+    entity_names = {}
+
+    # 1. 加载entity_list: freebase_mid → remap_id
+    mid_to_id = {}
+    with open(os.path.join(data_dir, 'entity_list.txt'), 'r') as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().rsplit(maxsplit=1)
+            if len(parts) == 2:
+                org_id, remap_id = parts[0], int(parts[1])
+                mid_to_id[org_id] = remap_id
+                entity_names[remap_id] = org_id
+
+    # 2. 加载item_list: ISBN → remap_id
+    item_ids = set()
+    isbn_to_id = {}
+    with open(os.path.join(data_dir, 'item_list.txt'), 'r') as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                isbn, remap_id = parts[0], int(parts[1])
+                item_ids.add(remap_id)
+                isbn_to_id[isbn] = remap_id
+
+    # 3. 尝试加载ISBN→书名映射
+    title_path = os.path.join(data_dir, 'isbn_to_title.json')
+    if os.path.exists(title_path):
+        print(f"[Entity] 加载书名映射: {title_path}")
+        try:
+            with open(title_path, 'r') as f:
+                isbn_to_title = json.load(f)
+            matched = 0
+            for isbn, remap_id in isbn_to_id.items():
+                if isbn in isbn_to_title:
+                    entity_names[remap_id] = isbn_to_title[isbn]
+                    matched += 1
+            print(f"[Entity] 书名匹配: {matched}/{len(isbn_to_id)} items")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[Entity] ⚠ isbn_to_title.json 解析失败: {e}")
+            print(f"[Entity] 回退使用ISBN作为item名称")
+            for isbn, remap_id in isbn_to_id.items():
+                entity_names[remap_id] = f"Book(ISBN:{isbn})"
+    else:
+        print(f"[Entity] 未找到isbn_to_title.json，item使用ISBN作为名称")
+        for isbn, remap_id in isbn_to_id.items():
+            entity_names[remap_id] = f"Book(ISBN:{isbn})"
+
+    print(f"[Entity] 总实体数: {len(entity_names)}, 其中item: {len(item_ids)}")
+    return entity_names, item_ids
+
+
+def load_relation_names(data_dir):
+    """
+    加载关系ID → 可读名称的映射
+    将Freebase URL转为简短可读名称
+    """
+    relation_names = {}
+    with open(os.path.join(data_dir, 'relation_list.txt'), 'r') as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().rsplit(maxsplit=1)
+            if len(parts) == 2:
+                org_id, remap_id = parts[0], int(parts[1])
+                if '/' in org_id:
+                    short_name = org_id.split('/')[-1]
+                else:
+                    short_name = org_id
+                relation_names[remap_id] = short_name
+
+    print(f"[Relation] 总关系数: {len(relation_names)}")
+    return relation_names
+
+
+def load_kg_triplets(data_dir):
+    """加载KG三元组，返回 numpy array [N, 3] 和邻接字典"""
+    triplets = []
+    kg_dict = defaultdict(list)
+    with open(os.path.join(data_dir, 'kg_final.txt'), 'r') as f:
+        for line in f:
+            h, r, t = [int(x) for x in line.strip().split()]
+            triplets.append([h, r, t])
+            kg_dict[h].append((t, r))
+    triplets = np.array(triplets)
+    print(f"[KG] 三元组数: {len(triplets)}")
+    return triplets, kg_dict
+
+
+def triplet_to_text(h, r, t, entity_names, relation_names):
+    """将单条三元组转为自然语言描述"""
+    h_name = entity_names.get(h, f"entity_{h}")
+    r_name = relation_names.get(r, f"relation_{r}")
+    t_name = entity_names.get(t, f"entity_{t}")
+    return f"({h_name}, {r_name}, {t_name})"
+
+
+def generate_negative_samples(triplets, kg_dict, n_entities, n_items, n_relations,
+                              neg_ratio=1, strategy='mixed'):
+    """
+    为KG三元组生成负样本
+
+    策略: 'replace_tail', 'replace_head', 'replace_rel', 'mixed'(随机选一)
+    """
+    triplet_set = set(map(tuple, triplets.tolist()))
+    neg_triplets = []
+
+    for h, r, t in tqdm(triplets, desc="生成负样本"):
+        for _ in range(neg_ratio):
+            for attempt in range(10):
+                if strategy == 'mixed':
+                    choice = random.choice(['replace_tail', 'replace_head', 'replace_rel'])
+                else:
+                    choice = strategy
+
+                if choice == 'replace_tail':
+                    new_t = random.randint(0, n_entities - 1)
+                    neg = (h, r, new_t)
+                elif choice == 'replace_head':
+                    new_h = random.randint(0, n_entities - 1)
+                    neg = (new_h, r, t)
+                else:
+                    new_r = random.randint(0, n_relations - 1)
+                    neg = (h, new_r, t)
+
+                if neg not in triplet_set:
+                    neg_triplets.append(list(neg))
+                    break
+
+    neg_triplets = np.array(neg_triplets)
+    print(f"[Neg] 生成负样本: {len(neg_triplets)}")
+    return neg_triplets
+
+
+def build_llm_train_data(data_dir, output_dir, neg_ratio=1, max_samples=None):
+    """
+    构建LLM微调训练数据（MS-Swift JSONL格式）
+
+    输出每行: {"instruction": "...", "input": "(h, r, t)", "output": "True"/"False"}
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    entity_names, item_ids = load_entity_names(data_dir)
+    relation_names = load_relation_names(data_dir)
+    triplets, kg_dict = load_kg_triplets(data_dir)
+
+    n_entities = max(entity_names.keys()) + 1
+    n_items = len(item_ids)
+    n_relations = len(relation_names)
+
+    # 优化：先子采样三元组再生成负样本，避免对全量2.5M三元组生成负样本
+    if max_samples and max_samples < len(triplets):
+        print(f"[优化] 从 {len(triplets)} 三元组中采样 {max_samples} 条用于训练")
+        sample_indices = random.sample(range(len(triplets)), max_samples)
+        sampled_triplets = triplets[sample_indices]
+    else:
+        sampled_triplets = triplets
+
+    neg_triplets = generate_negative_samples(
+        sampled_triplets, kg_dict, n_entities, n_items, n_relations,
+        neg_ratio=neg_ratio
+    )
+
+    instruction = (
+        "你是一个知识图谱验证专家。请判断以下三元组（头实体, 关系, 尾实体）是否为真实有效的知识关系。\n"
+        "如果三元组描述了一个合理的事实关系，回答 True；如果三元组是虚假或不合理的，回答 False。\n"
+        "只需回答 True 或 False，不要解释。"
+    )
+
+    samples = []
+
+    for idx in tqdm(range(len(sampled_triplets)), desc="构建正样本"):
+        h, r, t = sampled_triplets[idx]
+        text = triplet_to_text(h, r, t, entity_names, relation_names)
+        samples.append({"instruction": instruction, "input": text, "output": "True"})
+
+    for idx in tqdm(range(len(neg_triplets)), desc="构建负样本"):
+        h, r, t = neg_triplets[idx]
+        text = triplet_to_text(h, r, t, entity_names, relation_names)
+        samples.append({"instruction": instruction, "input": text, "output": "False"})
+
+    random.shuffle(samples)
+
+    split_idx = int(len(samples) * 0.95)
+    train_samples = samples[:split_idx]
+    val_samples = samples[split_idx:]
+
+    train_path = os.path.join(output_dir, 'train.jsonl')
+    val_path = os.path.join(output_dir, 'val.jsonl')
+
+    with open(train_path, 'w', encoding='utf-8') as f:
+        for s in train_samples:
+            f.write(json.dumps(s, ensure_ascii=False) + '\n')
+
+    with open(val_path, 'w', encoding='utf-8') as f:
+        for s in val_samples:
+            f.write(json.dumps(s, ensure_ascii=False) + '\n')
+
+    print(f"\n[LLM训练数据] 总样本: {len(samples)}")
+    print(f"  训练集: {len(train_samples)} -> {train_path}")
+    print(f"  验证集: {len(val_samples)} -> {val_path}")
+    return train_path, val_path
+
+
+def build_llm_inference_data(data_dir, output_path):
+    """
+    构建LLM推理数据——对所有KG三元组生成推理输入
+
+    输出: {"triple_idx": idx, "h": h, "r": r, "t": t, "instruction": "...", "input": "..."}
+    """
+    entity_names, _ = load_entity_names(data_dir)
+    relation_names = load_relation_names(data_dir)
+    triplets, _ = load_kg_triplets(data_dir)
+
+    instruction = (
+        "你是一个知识图谱验证专家。请判断以下三元组（头实体, 关系, 尾实体）是否为真实有效的知识关系。\n"
+        "如果三元组描述了一个合理的事实关系，回答 True；如果三元组是虚假或不合理的，回答 False。\n"
+        "只需回答 True 或 False，不要解释。"
+    )
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for idx, (h, r, t) in enumerate(tqdm(triplets, desc="构建推理数据")):
+            text = triplet_to_text(h, r, t, entity_names, relation_names)
+            sample = {
+                "triple_idx": idx,
+                "h": int(h), "r": int(r), "t": int(t),
+                "instruction": instruction,
+                "input": text
+            }
+            f.write(json.dumps(sample, ensure_ascii=False) + '\n')
+
+    print(f"[LLM推理数据] 三元组数: {len(triplets)} -> {output_path}")
+
+
+def parse_llm_predictions_to_mask(prediction_path, n_triplets, output_mask_path):
+    """
+    将LLM推理结果转为numpy掩码文件
+
+    掩码: [n_triplets] float32, 1.0=真实保留, 0.0=虚假丢弃
+    """
+    mask = np.ones(n_triplets, dtype=np.float32)
+
+    parsed = 0
+    with open(prediction_path, 'r') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            idx = item['triple_idx']
+            pred = item.get('prediction', item.get('output', '')).strip().lower()
+            if pred in ('false', '0', 'no'):
+                mask[idx] = 0.0
+            parsed += 1
+
+    np.save(output_mask_path, mask)
+
+    n_kept = int(mask.sum())
+    n_removed = n_triplets - n_kept
+    print(f"[LLM掩码] 解析: {parsed}/{n_triplets}")
+    print(f"  保留: {n_kept} ({n_kept/n_triplets*100:.1f}%)")
+    print(f"  移除: {n_removed} ({n_removed/n_triplets*100:.1f}%)")
+    print(f"  输出: {output_mask_path}")
+    return mask
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="LLM训练数据生成工具")
+    parser.add_argument('--dataset', default='amazon-book')
+    parser.add_argument('--data_path', default='data/')
+    parser.add_argument('--output_dir', default=None)
+    parser.add_argument('--mode', choices=['train', 'inference', 'parse_mask'], default='train')
+    parser.add_argument('--neg_ratio', type=int, default=1)
+    parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument('--prediction_path', default=None)
+    parser.add_argument('--n_triplets', type=int, default=None)
+
+    args = parser.parse_args()
+    data_dir = os.path.join(args.data_path, args.dataset)
+
+    if args.output_dir is None:
+        args.output_dir = os.path.join(data_dir, 'llm_data')
+
+    if args.mode == 'train':
+        build_llm_train_data(data_dir, args.output_dir,
+                            neg_ratio=args.neg_ratio,
+                            max_samples=args.max_samples)
+
+    elif args.mode == 'inference':
+        output_path = os.path.join(args.output_dir, 'inference_input.jsonl')
+        os.makedirs(args.output_dir, exist_ok=True)
+        build_llm_inference_data(data_dir, output_path)
+
+    elif args.mode == 'parse_mask':
+        if not args.prediction_path:
+            raise ValueError("parse_mask 模式需要指定 --prediction_path")
+        if not args.n_triplets:
+            with open(os.path.join(data_dir, 'kg_final.txt'), 'r') as f:
+                args.n_triplets = sum(1 for _ in f)
+        mask_path = os.path.join(args.output_dir, 'llm_mask.npy')
+        os.makedirs(args.output_dir, exist_ok=True)
+        parse_llm_predictions_to_mask(args.prediction_path, args.n_triplets, mask_path)

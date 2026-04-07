@@ -94,15 +94,6 @@ def parse_args():
     parser.add_argument("--mm_debug", action="store_true", help="打印多模态特征加载和融合的调试信息")
     parser.add_argument("--quick_test", action="store_true", help="快速测试模式：仅跑2轮，验证代码能否跑通")
 
-    # ===== LLM教师模型参数（替代KGC） ===== #
-    parser.add_argument("--llm_model_path", type=str, default=None,
-                       help="LLM基座模型路径（如Qwen3-4B-Instruct-2507）")
-    parser.add_argument("--llm_adapter_path", type=str, 
-                       default="output/qwen3-kg-sft-xujia/checkpoint-37736",
-                       help="LLM LoRA adapter路径")
-    parser.add_argument("--llm_batch_size", type=int, default=256,
-                       help="LLM批量推理大小")
-
     # ===== 显著性检验参数 ===== #
     parser.add_argument("--seed", type=int, default=None, help="随机种子（用于显著性检验的多次实验）")
     parser.add_argument("--no_mm", action="store_true", help="禁用多模态特征（作为基线对照）")

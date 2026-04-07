@@ -8,6 +8,9 @@ result/
 *.log
 nohup.out
 
+# model outputs & checkpoints (large files, save locally)
+output/
+
 # python
 __pycache__/
 *.pyc

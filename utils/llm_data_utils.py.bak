@@ -1,0 +1,322 @@
+# -*- coding: utf-8 -*-
+"""
+llm_data_utils.py — 高质量LLM训练/推理数据生成工具
+
+将KG三元组转换为自然语言陈述句，使LLM能真正理解并判断其真假。
+"""
+import os
+import json
+import random
+import argparse
+import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
+
+SKIP_RELATIONS = {
+    'type.object.type', 'type.type.instance', '22-rdf-syntax-ns#type',
+    'kg.object_profile.prominent_type', 'common.topic.notable_types',
+    'freebase.valuenotation.is_reviewed', 'freebase.valuenotation.has_value',
+    'freebase.valuenotation.has_no_value', 'type.object.name',
+    'common.topic.topical_webpage', 'common.topic.official_website',
+    'base.yupgrade.user.topics', 'rdf-schema#label',
+}
+
+REL_TEMPLATES = {
+    'book.written_work.author': '"{head}" was written by "{tail}"',
+    'book.author.works_written': '"{head}" wrote "{tail}"',
+    'book.book.genre': '"{head}" belongs to the genre "{tail}"',
+    'media_common.literary_genre.books_in_this_genre': '"{head}" is a genre that includes the book "{tail}"',
+    'book.written_work.subjects': '"{head}" is about the subject "{tail}"',
+    'book.book_subject.works': '"{head}" is the subject of "{tail}"',
+    'book.written_work.original_language': '"{head}" was originally written in "{tail}"',
+    'book.written_work.date_of_first_publication': '"{head}" was first published in {tail}',
+    'book.written_work.copyright_date': '"{head}" has a copyright date of {tail}',
+    'book.book_character.appears_in_book': '"{head}" is a character that appears in "{tail}"',
+    'book.book.characters': '"{head}" features the character "{tail}"',
+    'book.literary_series.works_in_this_series': 'The series "{head}" contains "{tail}"',
+    'book.written_work.part_of_series': '"{head}" is part of the series "{tail}"',
+    'book.written_work.previous_in_series': '"{head}" is preceded by "{tail}" in its series',
+    'book.written_work.next_in_series': '"{head}" is followed by "{tail}" in its series',
+    'book.illustrator.books_illustrated': '"{head}" illustrated "{tail}"',
+    'book.book.interior_illustrations_by': '"{head}" was illustrated by "{tail}"',
+    'book.short_story.genre': '"{head}" belongs to the genre "{tail}"',
+    'theater.play.country_of_origin': '"{head}" originated in "{tail}"',
+    'theater.play.genre': '"{head}" belongs to the genre "{tail}"',
+    'theater.theater_genre.plays_in_this_genre': '"{head}" is a genre that includes "{tail}"',
+    'theater.play.date_of_first_performance': '"{head}" was first performed in {tail}',
+    'book.written_work.date_written': '"{head}" was written in {tail}',
+    'fictional_universe.work_of_fiction.part_of_these_fictional_universes': '"{head}" is set in the fictional universe "{tail}"',
+    'fictional_universe.fictional_universe.works_set_here': '"{head}" is a fictional universe featured in "{tail}"',
+    'media_common.literary_genre.stories_in_this_genre': '"{head}" is a genre that includes the story "{tail}"',
+}
+
+SYSTEM_PROMPT = (
+    "You are a knowledge graph validation expert. Given the following statement about "
+    "a book or literary work, determine if it describes a factually correct relationship.\n"
+    "Answer only True or False."
+)
+
+
+def load_item_meta(data_dir):
+    item_ids = set()
+    isbn_map = {}
+    with open(os.path.join(data_dir, 'item_list.txt'), 'r') as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                item_ids.add(int(parts[1]))
+                isbn_map[int(parts[1])] = parts[0]
+    isbn_to_meta = {}
+    meta_path = os.path.join(data_dir, 'meta_Books.jsonl')
+    if os.path.exists(meta_path):
+        with open(meta_path, 'r') as f:
+            for line in tqdm(f, desc="解析meta_Books"):
+                d = json.loads(line)
+                asin = d.get('parent_asin', '')
+                if not asin:
+                    continue
+                title = d.get('title', '').strip()
+                author = ''
+                try:
+                    a = d.get('author', '')
+                    if isinstance(a, str) and a:
+                        a = json.loads(a.replace("'", '"'))
+                    if isinstance(a, dict):
+                        author = a.get('name', '')
+                    elif isinstance(a, list) and a:
+                        names = [x.get('name', '') for x in a if isinstance(x, dict)]
+                        author = names[0] if names else ''
+                except Exception:
+                    pass
+                cats = d.get('categories', [])
+                if isinstance(cats, str):
+                    try:
+                        cats = json.loads(cats.replace("'", '"'))
+                    except Exception:
+                        cats = []
+                isbn_to_meta[asin] = {
+                    'title': title, 'author': author,
+                    'categories': [c for c in cats if isinstance(c, str)]
+                }
+    print(f"[Meta] items: {len(item_ids)}, meta条目: {len(isbn_to_meta)}")
+    return item_ids, isbn_map, isbn_to_meta
+
+
+def load_relations(data_dir):
+    rel_names = {}
+    with open(os.path.join(data_dir, 'relation_list.txt'), 'r') as f:
+        next(f)
+        for line in f:
+            parts = line.strip().rsplit(maxsplit=1)
+            if len(parts) == 2:
+                rel_names[int(parts[1])] = parts[0].split('/')[-1]
+    skip_rids = {rid for rid, rn in rel_names.items() if rn in SKIP_RELATIONS}
+    print(f"[Rel] 总关系: {len(rel_names)}, 跳过: {len(skip_rids)}")
+    return rel_names, skip_rids
+
+
+def load_kg(data_dir):
+    triplets = []
+    with open(os.path.join(data_dir, 'kg_final.txt'), 'r') as f:
+        for line in f:
+            h, r, t = [int(x) for x in line.strip().split()]
+            triplets.append((h, r, t))
+    print(f"[KG] 三元组: {len(triplets)}")
+    return triplets
+
+
+def build_entity_names(item_ids, isbn_map, isbn_to_meta, triplets, rel_names):
+    entity_names = {}
+    for rid, isbn in isbn_map.items():
+        meta = isbn_to_meta.get(isbn)
+        if meta and meta['title']:
+            entity_names[rid] = meta['title']
+    author_rels = {'book.written_work.author', 'book.author.works_written'}
+    genre_rels = {
+        'book.book.genre', 'media_common.literary_genre.books_in_this_genre',
+        'book.short_story.genre', 'theater.play.genre',
+        'theater.theater_genre.plays_in_this_genre',
+        'media_common.literary_genre.stories_in_this_genre',
+    }
+    for h, r, t in triplets:
+        rn = rel_names.get(r, '')
+        if rn in author_rels:
+            book_id = h if h in item_ids else (t if t in item_ids else None)
+            author_id = t if t not in item_ids else (h if h not in item_ids else None)
+            if book_id and author_id and author_id not in entity_names:
+                isbn = isbn_map.get(book_id, '')
+                meta = isbn_to_meta.get(isbn)
+                if meta and meta['author']:
+                    entity_names[author_id] = meta['author']
+        if rn in genre_rels:
+            book_id = h if h in item_ids else (t if t in item_ids else None)
+            genre_id = t if t not in item_ids else (h if h not in item_ids else None)
+            if book_id and genre_id and genre_id not in entity_names:
+                isbn = isbn_map.get(book_id, '')
+                meta = isbn_to_meta.get(isbn)
+                if meta and meta['categories']:
+                    entity_names[genre_id] = meta['categories'][-1]
+    named_items = sum(1 for e in item_ids if e in entity_names)
+    named_non = sum(1 for e in entity_names if e not in item_ids)
+    print(f"[Names] item命名: {named_items}/{len(item_ids)}, 非item命名: {named_non}")
+    return entity_names
+
+
+def make_nl_statement(h, r, t, entity_names, rel_names):
+    h_name = entity_names.get(h)
+    t_name = entity_names.get(t)
+    rn = rel_names.get(r, '')
+    template = REL_TEMPLATES.get(rn)
+    if not h_name or not t_name or not template:
+        return None
+    return template.format(head=h_name, tail=t_name)
+
+
+def build_train_data(data_dir, output_dir, max_samples=25000, seed=2023):
+    random.seed(seed)
+    os.makedirs(output_dir, exist_ok=True)
+    item_ids, isbn_map, isbn_to_meta = load_item_meta(data_dir)
+    rel_names, skip_rids = load_relations(data_dir)
+    triplets = load_kg(data_dir)
+    entity_names = build_entity_names(item_ids, isbn_map, isbn_to_meta, triplets, rel_names)
+    named_semantic = [(h, r, t) for h, r, t in triplets
+                      if r not in skip_rids
+                      and h in entity_names and t in entity_names
+                      and rel_names.get(r) in REL_TEMPLATES]
+    print(f"可用三元组: {len(named_semantic)}")
+    triplet_set = set(triplets)
+    rel_tails = defaultdict(list)
+    for h, r, t in named_semantic:
+        rel_tails[r].append(t)
+    selected = random.sample(named_semantic, min(max_samples, len(named_semantic)))
+    all_samples = []
+    for h, r, t in tqdm(selected, desc="构建训练样本"):
+        stmt = make_nl_statement(h, r, t, entity_names, rel_names)
+        if not stmt:
+            continue
+        all_samples.append({"role": "pos", "input": stmt, "output": "True"})
+        candidates = rel_tails.get(r, [])
+        if len(candidates) > 1:
+            for _ in range(5):
+                new_t = random.choice(candidates)
+                if new_t != t and (h, r, new_t) not in triplet_set:
+                    neg_stmt = make_nl_statement(h, r, new_t, entity_names, rel_names)
+                    if neg_stmt:
+                        all_samples.append({"role": "neg", "input": neg_stmt, "output": "False"})
+                    break
+    pos = [s for s in all_samples if s['role'] == 'pos']
+    neg = [s for s in all_samples if s['role'] == 'neg']
+    min_count = min(len(pos), len(neg))
+    pos = random.sample(pos, min_count)
+    neg = random.sample(neg, min_count)
+    balanced = pos + neg
+    random.shuffle(balanced)
+    def to_swift(s):
+        return {"messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": s["input"]},
+            {"role": "assistant", "content": s["output"]}
+        ]}
+    split_idx = int(len(balanced) * 0.95)
+    train = balanced[:split_idx]
+    val = balanced[split_idx:]
+    for name, data in [('train_swift.jsonl', train), ('val_swift.jsonl', val)]:
+        path = os.path.join(output_dir, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            for s in data:
+                f.write(json.dumps(to_swift(s), ensure_ascii=False) + '\n')
+        print(f"  {name}: {len(data)} -> {path}")
+    print(f"总计: {len(balanced)} (正:{min_count}, 负:{min_count})")
+
+
+def build_inference_data(data_dir, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    item_ids, isbn_map, isbn_to_meta = load_item_meta(data_dir)
+    rel_names, skip_rids = load_relations(data_dir)
+    triplets = load_kg(data_dir)
+    entity_names = build_entity_names(item_ids, isbn_map, isbn_to_meta, triplets, rel_names)
+    out_path = os.path.join(output_dir, 'inference_input.jsonl')
+    infer_only_path = os.path.join(output_dir, 'inference_swift.jsonl')
+    total, generable = 0, 0
+    with open(out_path, 'w', encoding='utf-8') as f_all, \
+         open(infer_only_path, 'w', encoding='utf-8') as f_infer:
+        for idx, (h, r, t) in enumerate(tqdm(triplets, desc="构建推理数据")):
+            total += 1
+            stmt = None
+            if r not in skip_rids:
+                stmt = make_nl_statement(h, r, t, entity_names, rel_names)
+            if stmt:
+                generable += 1
+                record = {
+                    "triple_idx": idx,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": stmt}
+                    ]
+                }
+                f_all.write(json.dumps(record, ensure_ascii=False) + '\n')
+                f_infer.write(json.dumps({
+                    "messages": record["messages"]
+                }, ensure_ascii=False) + '\n')
+            else:
+                record = {"triple_idx": idx, "skipped": True, "messages": None}
+                f_all.write(json.dumps(record, ensure_ascii=False) + '\n')
+    print(f"推理数据: {total} 三元组, 可推理: {generable} ({generable/total*100:.1f}%)")
+    return out_path
+
+
+def parse_mask(data_dir, output_dir, inference_result_path):
+    triplets = load_kg(data_dir)
+    n_triplets = len(triplets)
+    mask = np.ones(n_triplets, dtype=np.float32)
+    infer_input_path = os.path.join(output_dir, 'inference_input.jsonl')
+    generable_indices = []
+    with open(infer_input_path, 'r') as f:
+        for line in f:
+            d = json.loads(line)
+            if not d.get('skipped', False):
+                generable_indices.append(d['triple_idx'])
+    result_count = 0
+    removed = 0
+    with open(inference_result_path, 'r') as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                response = d.get('response', d.get('output', '')).strip().lower()
+            except json.JSONDecodeError:
+                response = line.strip().lower()
+            if i < len(generable_indices):
+                triple_idx = generable_indices[i]
+                if 'false' in response:
+                    mask[triple_idx] = 0.0
+                    removed += 1
+                result_count += 1
+    mask_path = os.path.join(output_dir, 'llm_mask.npy')
+    np.save(mask_path, mask)
+    print(f"Mask: {n_triplets} 三元组, 推理判定: {result_count}, 删除: {removed} ({removed/max(1,result_count)*100:.1f}%)")
+    print(f"Mask保存: {mask_path}")
+    return mask_path
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, required=True, choices=['train', 'inference', 'parse_mask'])
+    parser.add_argument('--dataset', type=str, default='amazon-book')
+    parser.add_argument('--max_samples', type=int, default=25000)
+    parser.add_argument('--seed', type=int, default=2023)
+    parser.add_argument('--inference_result', type=str, default=None)
+    args = parser.parse_args()
+    data_dir = f'data/{args.dataset}'
+    output_dir = f'data/{args.dataset}/llm_data'
+    if args.mode == 'train':
+        build_train_data(data_dir, output_dir, max_samples=args.max_samples, seed=args.seed)
+    elif args.mode == 'inference':
+        build_inference_data(data_dir, output_dir)
+    elif args.mode == 'parse_mask':
+        if not args.inference_result:
+            raise ValueError("--inference_result required for parse_mask mode")
+        parse_mask(data_dir, output_dir, args.inference_result)
