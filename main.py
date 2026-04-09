@@ -17,6 +17,7 @@
 Created on Tue May 16 23:45:11 2023
 """
 import os
+import subprocess
 
 import sys
 import math
@@ -33,6 +34,8 @@ import scipy.sparse as sp
 from collections import Counter, defaultdict
 
 from utils.parser import parse_args
+from utils.path_utils import ensure_dir, resolve_dataset_dir
+from utils.memory_monitor import log_cuda_mem, MemTimer
 from prettytable import PrettyTable
 # [已删除] accuracy_score — KGC验证不再需要
 from utils.data_loader import load_data
@@ -40,7 +43,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # [已删除] KGR模型不再使用
 from modules.EDKG import Recommender       # 核心推荐模型
-from modules.llm_scorer import LLMScorer   # LLM三元组评分器（替代KGC教师）
 
 from utils.evaluate import test            # 多进程评估函数
 from utils.helper import early_stopping, _generate_candi_kg, _cal_npmi
@@ -117,6 +119,10 @@ if __name__ == '__main__':
     global args, device, train_user_set, kg_dict, item_lists_dict, ent_lists_dict
     args = parse_args()
     device = torch.device("cuda:" + str(args.gpu_id)) if args.cuda else torch.device("cpu")
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
+    llm_score_dir = args.llm_score_dir or os.path.join(data_dir, "llm_scores")
+    llm_score_dir = ensure_dir(llm_score_dir)
+    llm_score_cache_path = args.llm_score_cache_path or os.path.join(llm_score_dir, "triplet_score_cache.pt")
 
     # 固定随机种子（用于显著性检验的多次实验）
     if args.seed is not None:
@@ -128,6 +134,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         print(f"[SEED] 随机种子已设置为 {seed}")
+    log_cuda_mem("startup.after_seed", device, args.mem_debug)
 
     # ===== 2. 加载数据 =====
     # train_cf: 训练交互对 [N, 2]
@@ -140,6 +147,7 @@ if __name__ == '__main__':
     # triplets: 所有KG三元组 [N, 3]
     # kg_dict: {head: [(tail, relation), ...]} 邻接字典
     train_cf, test_cf, user_dict, n_params, graph, ui_sparse_graph, all_sparse_graph, item_rel_mask, triplets, kg_dict, v_feat, t_feat = load_data(args)
+    log_cuda_mem("after.load_data", device, args.mem_debug)
 
     # 如果指定 --no_mm，禁用多模态特征（作为基线对照）
     if args.no_mm:
@@ -150,7 +158,9 @@ if __name__ == '__main__':
     # ===== 3. 计算物品间 NPMI（论文 Section 3.1, Eq.1）=====
     # NPMI(i,j) 衡量物品 i 和 j 的共现关联强度
     item_pmi_dict = _cal_npmi(user_dict['train_user_set'])
-    pkl.dump(item_pmi_dict, open(args.dataset + "item_pair_pmi.pkl", "wb"))
+    log_cuda_mem("after.npmi", device, args.mem_debug)
+    pmi_cache_path = os.path.join(resolve_dataset_dir(args.data_path, args.dataset), "item_pair_pmi.pkl")
+    pkl.dump(item_pmi_dict, open(pmi_cache_path, "wb"))
     
     # 设置全局变量
     n_users = n_params['n_users']
@@ -165,25 +175,30 @@ if __name__ == '__main__':
 
     # ===== 5. 创建模型 =====
     model = Recommender(n_params, args, graph, ui_sparse_graph, item_rel_mask, v_feat=v_feat, t_feat=t_feat).to(device)
+    log_cuda_mem("after.model_init", device, args.mem_debug)
 
     # ===== 5.5 初始化LLM评分器（替代KGC教师）=====
     llm_scorer = None
-    if args.llm_model_path:
-        data_dir = os.path.join(args.data_path, args.dataset)
+    if args.llm_model_path and args.llm_score_mode == "online":
+        from modules.llm_scorer import LLMScorer
         llm_scorer = LLMScorer(
             model_path=args.llm_model_path,
             adapter_path=args.llm_adapter_path,
             data_dir=data_dir,
             device=f"cuda:{args.gpu_id}",
             batch_size=args.llm_batch_size,
+            mem_debug=args.mem_debug,
         )
         print(f"[LLM] LLM评分器已就绪")
+    elif args.llm_model_path and args.llm_score_mode == "subprocess":
+        print("[LLM] 使用 subprocess 模式：每3轮启动独立进程打分，不在训练进程常驻LLM")
     else:
         print("[LLM] 未指定--llm_model_path，跳过LLM教师蒸馏（mmd_loss=0）")
 
     # ===== 6. 创建优化器 =====
     # 主优化器：Adam
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    log_cuda_mem("after.optimizer_init", device, args.mem_debug)
     # [已删除] PCGrad包装 — 仅单一损失，使用标准Adam
     
     # [已删除] kgr_optimizer — KGC训练已移至LLM独立训练
@@ -223,6 +238,7 @@ if __name__ == '__main__':
         # ----- 每3轮：Knowledge Generator + Knowledge Deleter 更新 -----
         # Knowledge Generator: 生成候选KG并更新Potential KG
         if epoch % 3 == 0:
+            log_cuda_mem(f"epoch{epoch}.kg_refresh.before", device, args.mem_debug)
             # Step 1: 基于NPMI生成候选KG三元组（论文 Eq.2-4）
             # pmi_threshold=0.6: NPMI阈值（不同数据集需调整: yelp/MIND=0.7, others=0.5）
             candi_kg = _generate_candi_kg(item_pmi_dict, n_items, kg_dict,
@@ -237,14 +253,46 @@ if __name__ == '__main__':
             # Step 4: 将候选KG更新到模型中（作为 Potential KG）
             all_candi_kg = torch.LongTensor(all_candi_kg).to(device)
             model.gcn._update_knowledge(all_candi_kg)
+            log_cuda_mem(f"epoch{epoch}.kg_refresh.after_update", device, args.mem_debug,
+                         extra=f"candidates={len(all_candi_kg)}")
             
             # Step 5: ★ LLM教师预计算 Potential KG 所有三元组的真实性分数 ★
             # 替代原来的KGC在线训练+推理，LLM只需推理一次，结果缓存供后续每batch查表
-            if llm_scorer is not None:
+            if args.llm_model_path and args.llm_score_mode == "subprocess":
+                triplets_path = os.path.join(llm_score_dir, f"candidate_triplets_epoch_{epoch:03d}.pt")
+                scores_path = os.path.join(llm_score_dir, f"llm_scores_epoch_{epoch:03d}.pt")
+                torch.save(all_candi_kg.detach().cpu(), triplets_path)
+                print(f"[LLM] 候选KG已保存: {triplets_path}")
+                cmd = [
+                    sys.executable,
+                    os.path.join(os.path.dirname(__file__), "utils", "precompute_llm_scores.py"),
+                    "--triplets_path", triplets_path,
+                    "--output_path", scores_path,
+                    "--data_dir", data_dir,
+                    "--model_path", args.llm_model_path,
+                    "--adapter_path", args.llm_adapter_path,
+                    "--cache_path", llm_score_cache_path,
+                    "--batch_size", str(args.llm_batch_size),
+                    "--gpu_id", str(args.gpu_id),
+                ]
+                if args.mem_debug:
+                    cmd.append("--mem_debug")
+                print(f"[LLM] 启动独立进程打分: {' '.join(cmd)}")
+                with MemTimer(f"epoch{epoch}.llm_subprocess", device, args.mem_debug):
+                    subprocess.run(cmd, check=True)
+                llm_scores = torch.load(scores_path, map_location=device)
+                model.gcn.set_llm_scores(llm_scores)
+                print(f"[LLM] subprocess 打分完成, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
+                log_cuda_mem(f"epoch{epoch}.llm_scores_loaded", device, args.mem_debug,
+                             extra=f"shape={tuple(llm_scores.shape)}")
+            elif llm_scorer is not None:
                 print(f"[LLM] 对 {len(all_candi_kg)} 条候选三元组进行真实性评分...")
-                llm_scores = llm_scorer.score_triplets(all_candi_kg, target_device=device)
+                with MemTimer(f"epoch{epoch}.llm_online", device, args.mem_debug):
+                    llm_scores = llm_scorer.score_triplets(all_candi_kg, target_device=device)
                 model.gcn.set_llm_scores(llm_scores)
                 print(f"[LLM] 分数已缓存, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
+                log_cuda_mem(f"epoch{epoch}.llm_scores_cached", device, args.mem_debug,
+                             extra=f"shape={tuple(llm_scores.shape)}")
             
         # ----- CF推荐训练 -----
         # 对应论文 Section 3.3 + Section 3.4
@@ -262,22 +310,33 @@ if __name__ == '__main__':
             batch['pos_items'] = all_feed_data['pos_items'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
 
             # 前向传播：返回 (推荐损失, MMD蒸馏损失)
+            if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
+                log_cuda_mem(f"epoch{epoch}.batch{i}.before_forward", device, True)
             cet_loss, mmd_loss = model(batch)
             
             # 总损失 = 推荐损失 + MMD蒸馏损失（LLM教师→APL学生）
             batch_loss = cet_loss + mmd_loss
             
             optimizer.zero_grad()
+            if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
+                log_cuda_mem(f"epoch{epoch}.batch{i}.after_forward", device, True,
+                             extra=f"cet={cet_loss.item():.4f},mmd={mmd_loss.item():.4f}")
             batch_loss.backward()
+            if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
+                log_cuda_mem(f"epoch{epoch}.batch{i}.after_backward", device, True)
             optimizer.step()
+            if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
+                log_cuda_mem(f"epoch{epoch}.batch{i}.after_step", device, True)
             loss += batch_loss.item()
 
         train_e_t = time()
         
         # ----- 生成当前嵌入和KG掩码（用于下一轮的候选KG生成）-----
-        item_embs, KG_mask = model.generate(for_kgc=True)
+        with MemTimer(f"epoch{epoch}.generate", device, args.mem_debug):
+            item_embs, KG_mask = model.generate(for_kgc=True)
         item_embs = item_embs.detach().cpu().numpy()    # 物品嵌入 [n_items, dim*3]
         KG_mask = KG_mask.detach().cpu().numpy()         # APL掩码
+        log_cuda_mem(f"epoch{epoch}.after_generate_to_cpu", device, args.mem_debug)
 
         # ----- 评估（每轮都评估）-----
         if epoch % 1 == 0:

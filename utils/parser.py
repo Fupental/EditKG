@@ -13,6 +13,8 @@ parser.py — 命令行参数解析模块
 """
 import argparse
 
+from utils.path_utils import default_adapter_path, default_dataset_root
+
 
 def parse_args():
     """
@@ -25,7 +27,7 @@ def parse_args():
     # --dataset: 选择使用哪个数据集，论文实验用了 last-fm, amazon-book, yelp2018 三个
     parser.add_argument("--dataset", nargs="?", default="amazon-book", help="Choose a dataset:[last-fm,alibaba-ifashion,yelp2018,mind-f,amazon-book,MIND]")
     # --data_path: 数据文件存放的根目录，实际路径为 data_path + dataset + '/'
-    parser.add_argument("--data_path", nargs="?", default="data/", help="Input data path.")
+    parser.add_argument("--data_path", nargs="?", default=default_dataset_root(), help="Input data path.")
  
     # ===== 训练相关参数 ===== #
     # --epoch: 最大训练轮数（实际代码中 main.py 硬编码为100轮，此参数未被使用）
@@ -98,10 +100,21 @@ def parse_args():
     parser.add_argument("--llm_model_path", type=str, default=None,
                        help="LLM基座模型路径（如Qwen3-4B-Instruct-2507）")
     parser.add_argument("--llm_adapter_path", type=str, 
-                       default="output/qwen3-kg-sft-xujia/checkpoint-37736",
+                       default=default_adapter_path(),
                        help="LLM LoRA adapter路径")
     parser.add_argument("--llm_batch_size", type=int, default=256,
                        help="LLM批量推理大小")
+    parser.add_argument("--llm_score_mode", type=str, default="subprocess",
+                       choices=["subprocess", "online"],
+                       help="LLM打分模式：subprocess=每3轮启动独立进程打分，online=训练进程常驻LLM")
+    parser.add_argument("--llm_score_dir", type=str, default=None,
+                       help="LLM候选KG与分数缓存目录（默认: <dataset>/llm_scores）")
+    parser.add_argument("--llm_score_cache_path", type=str, default=None,
+                       help="LLM三元组历史分数缓存文件路径（默认: <llm_score_dir>/triplet_score_cache.pt）")
+    parser.add_argument("--mem_debug", action="store_true",
+                       help="打印训练和LLM关键阶段的GPU显存统计")
+    parser.add_argument("--mem_debug_interval", type=int, default=100,
+                       help="训练时每隔多少个batch打印一次显存统计")
 
     # ===== 显著性检验参数 ===== #
     parser.add_argument("--seed", type=int, default=None, help="随机种子（用于显著性检验的多次实验）")

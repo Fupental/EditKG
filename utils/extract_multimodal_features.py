@@ -37,6 +37,11 @@ import torch
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    from utils.path_utils import default_dataset_root, resolve_dataset_dir
+except ImportError:
+    from path_utils import default_dataset_root, resolve_dataset_dir
+
 
 def load_asin_to_itemid(data_dir):
     """
@@ -298,7 +303,7 @@ def extract_image_features(item_image_urls, n_items, device, batch_size=64, num_
 def main():
     parser = argparse.ArgumentParser(description="多模态特征提取")
     parser.add_argument("--dataset", type=str, default="amazon-book", help="数据集名称")
-    parser.add_argument("--data_path", type=str, default="data/", help="数据根目录")
+    parser.add_argument("--data_path", type=str, default=default_dataset_root(), help="数据根目录")
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID")
     parser.add_argument("--text_batch_size", type=int, default=128, help="文本编码批次大小")
     parser.add_argument("--image_batch_size", type=int, default=32, help="图像编码批次大小")
@@ -310,7 +315,7 @@ def main():
     parser.add_argument("--debug_samples", type=int, default=5, help="调试模式下每种模态处理的样本数")
     args = parser.parse_args()
 
-    data_dir = os.path.join(args.data_path, args.dataset)
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 

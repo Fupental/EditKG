@@ -23,6 +23,11 @@ import argparse
 import requests
 from tqdm import tqdm
 
+try:
+    from utils.path_utils import default_dataset_root, resolve_dataset_dir
+except ImportError:
+    from path_utils import default_dataset_root, resolve_dataset_dir
+
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 USER_AGENT = "EditKG-MID-Resolver/1.0 (research project)"
 
@@ -195,7 +200,7 @@ def write_entity_list(filepath, header, entities):
 def main():
     parser = argparse.ArgumentParser(description="通过Wikidata SPARQL解析Freebase MID")
     parser.add_argument("--dataset", default="amazon-book")
-    parser.add_argument("--data_path", default="data/")
+    parser.add_argument("--data_path", default=default_dataset_root())
     parser.add_argument("--limit", type=int, default=0,
                         help="最多解析多少个MID（0=全部）")
     parser.add_argument("--delay", type=float, default=1.5,
@@ -206,7 +211,7 @@ def main():
                         help="从缓存继续解析")
     args = parser.parse_args()
 
-    data_dir = os.path.join(args.data_path, args.dataset)
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     entity_file = os.path.join(data_dir, "entity_list.txt")
     cache_path = os.path.join(data_dir, "mid_names_cache.json")
 

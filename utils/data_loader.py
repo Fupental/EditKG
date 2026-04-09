@@ -37,6 +37,8 @@ warnings.filterwarnings('ignore')
 import pickle as pkl
 import os
 
+from utils.path_utils import resolve_dataset_dir
+
 # ========== 全局变量：数据规模统计 ==========
 n_users = 0       # 用户总数
 n_items = 0       # 物品总数
@@ -188,7 +190,8 @@ def generate_polluted_cf_data(train_cf, rate):
     for u, i in train_total:
         train_dict[int(u)].append(int(i))
 
-    f = open('./data/{}/train_noise_{}.txt'.format(args.dataset, rate), 'w')
+    output_path = os.path.join(resolve_dataset_dir(args.data_path, args.dataset), f'train_noise_{rate}.txt')
+    f = open(output_path, 'w')
     for key, val in train_dict.items():
         val = [key] + val
         val = ' '.join(str(x) for x in val)
@@ -232,7 +235,8 @@ def generate_polluted_kg_data(file_name, rate):
                 break
     triplets_np_total = np.vstack((np.array(triplets_np_total), triplets_np_ori))
 
-    f = open('./data/{}/kg_noise_{}.txt'.format(args.dataset, rate), 'w')
+    output_path = os.path.join(resolve_dataset_dir(args.data_path, args.dataset), f'kg_noise_{rate}.txt')
+    f = open(output_path, 'w')
     for h, r, t in triplets_np_total:
         f.write(str(h) + ' ' + str(r) + ' ' + str(t) + '\n')
     f.close()
@@ -347,8 +351,9 @@ def build_kg_set(triplets):
     
     缓存机制：首次计算后保存为 item_rel_mask_rev.pkl，后续直接加载
     """
-    if os.path.exists("item_rel_mask_rev.pkl"):
-        item_rel_mask_rev = pkl.load(open("item_rel_mask_rev.pkl", "rb"))
+    cache_path = os.path.join(resolve_dataset_dir(args.data_path, args.dataset), "item_rel_mask_rev.pkl")
+    if os.path.exists(cache_path):
+        item_rel_mask_rev = pkl.load(open(cache_path, "rb"))
     else:
         # 构建物品-关系掩码：item_rel_mask[item][relation] = 1 表示物品拥有该关系
         item_rel_mask = np.zeros((n_items, n_relations))
@@ -365,7 +370,7 @@ def build_kg_set(triplets):
         # 取反：1变0，0变1 → 标记物品缺失的关系
         item_rel_mask_rev = (~(item_rel_mask > 0)).astype("float")
         item_rel_mask_rev[:, 0] = 0  # 关系0是"interact"，不视为缺失属性
-        pkl.dump(item_rel_mask_rev, open("item_rel_mask_rev.pkl", "wb"))
+        pkl.dump(item_rel_mask_rev, open(cache_path, "wb"))
     return item_rel_mask_rev
 
 
@@ -479,7 +484,7 @@ def load_data(model_args):
     """
     global args
     args = model_args
-    directory = args.data_path + args.dataset + '/'
+    directory = resolve_dataset_dir(args.data_path, args.dataset) + '/'
 
     # 第一步：读取交互数据
     train_cf = read_cf(directory + 'train.txt')

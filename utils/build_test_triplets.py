@@ -11,7 +11,12 @@ import random
 import numpy as np
 from pathlib import Path
 
-DATA_DIR = Path("data/amazon-book")
+try:
+    from path_utils import default_dataset_root
+except ImportError:
+    from utils.path_utils import default_dataset_root
+
+DATA_DIR = Path(default_dataset_root()) / "amazon-book"
 random.seed(42)
 np.random.seed(42)
 

@@ -12,6 +12,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
+from path_utils import default_adapter_path, default_base_model_path, default_dataset_root, resolve_dataset_dir
+
 
 def load_model(model_path, adapter_path, device="cuda:0"):
     print(f"[模型] 加载基座: {model_path}")
@@ -41,10 +43,11 @@ def build_prompt(messages, tokenizer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', default='/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507')
-    parser.add_argument('--adapter_path', default='output/qwen3-kg-sft-xujia/checkpoint-37736')
-    parser.add_argument('--input_path', default='data/amazon-book/llm_data/inference_swift.jsonl')
-    parser.add_argument('--output_path', default='data/amazon-book/llm_data/inference_predictions.jsonl')
+    default_data_dir = resolve_dataset_dir(default_dataset_root(), 'amazon-book')
+    parser.add_argument('--model_path', default=default_base_model_path())
+    parser.add_argument('--adapter_path', default=default_adapter_path())
+    parser.add_argument('--input_path', default=os.path.join(default_data_dir, 'llm_data', 'inference_swift.jsonl'))
+    parser.add_argument('--output_path', default=os.path.join(default_data_dir, 'llm_data', 'inference_predictions.jsonl'))
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--resume', action='store_true', help='从上次中断处继续')

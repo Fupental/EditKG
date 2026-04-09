@@ -12,6 +12,11 @@ from tqdm import tqdm
 from collections import defaultdict
 from modelscope import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from utils.path_utils import default_base_model_path, default_dataset_root, resolve_dataset_dir
+except ImportError:
+    from path_utils import default_base_model_path, default_dataset_root, resolve_dataset_dir
+
 # ======== 关系分组 ========
 # 每组关系有对应的LLM prompt策略
 RELATION_GROUPS = {
@@ -101,7 +106,9 @@ def get_relation_group(rel_name):
     return None
 
 
-def load_model(model_path='/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B'):
+def load_model(model_path=None):
+    if model_path is None:
+        model_path = default_base_model_path()
     print(f"[LLM] Loading model from {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -141,7 +148,7 @@ def generate_similar_entities(model, tokenizer, entity_name, group, num=5):
     return entities[:num]
 
 
-def batch_generate_hard_negatives(data_dir, output_path, max_samples=2500, seed=2023):
+def batch_generate_hard_negatives(data_dir, output_path, max_samples=2500, seed=2023, model_path=None):
     """
     为训练数据生成LLM对抗性困难负样本。
 
@@ -157,20 +164,17 @@ def batch_generate_hard_negatives(data_dir, output_path, max_samples=2500, seed=
     # 动态加载同目录下的函数
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from llm_data_utils import (
-        load_item_meta, load_relations, load_kg, build_entity_names,
-        make_nl_statement, REL_TEMPLATES, SYSTEM_PROMPT
-    )
+    from llm_data_utils import load_item_meta, load_relations, load_kg, build_entity_names
+    from relation_templates import REL_TEMPLATES
 
     item_ids, isbn_map, isbn_to_meta = load_item_meta(data_dir)
-    rel_names, skip_rids = load_relations(data_dir)
+    rel_names = load_relations(data_dir)
     triplets = load_kg(data_dir)
-    entity_names = build_entity_names(item_ids, isbn_map, isbn_to_meta, triplets, rel_names)
+    entity_names = build_entity_names(item_ids, isbn_map, isbn_to_meta, triplets, rel_names, data_dir)
 
     # 筛选可翻译的三元组
     named_triplets = [(h, r, t) for h, r, t in triplets
-                      if r not in skip_rids
-                      and h in entity_names and t in entity_names
+                      if h in entity_names and t in entity_names
                       and rel_names.get(r) in REL_TEMPLATES]
     triplet_set = set(triplets)
     print(f"可用三元组: {len(named_triplets)}")
@@ -232,7 +236,7 @@ def batch_generate_hard_negatives(data_dir, output_path, max_samples=2500, seed=
     print(f"需要LLM生成替换的独特(实体,组)对: {len(entity_group_pairs)}")
 
     # 加载LLM
-    model, tokenizer = load_model()
+    model, tokenizer = load_model(model_path)
 
     # 批量生成替换候选
     replacement_cache = {}  # (entity_name, group) -> [replacement_name1, ...]
@@ -290,13 +294,19 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='amazon-book')
-    parser.add_argument('--data_path', default='data/')
+    parser.add_argument('--data_path', default=default_dataset_root())
+    parser.add_argument('--model_path', default=default_base_model_path())
     parser.add_argument('--max_samples', type=int, default=2500,
                         help='困难负样本数量（总训练数据的~10%%）')
     parser.add_argument('--seed', type=int, default=2023)
     args = parser.parse_args()
 
-    data_dir = os.path.join(args.data_path, args.dataset)
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     output_path = os.path.join(data_dir, 'llm_data', 'hard_negatives.jsonl')
-    batch_generate_hard_negatives(data_dir, output_path,
-                                  max_samples=args.max_samples, seed=args.seed)
+    batch_generate_hard_negatives(
+        data_dir,
+        output_path,
+        max_samples=args.max_samples,
+        seed=args.seed,
+        model_path=args.model_path,
+    )

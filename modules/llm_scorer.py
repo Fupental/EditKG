@@ -20,6 +20,7 @@ from peft import PeftModel
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utils.relation_templates import REL_TEMPLATES
+from utils.memory_monitor import log_cuda_mem
 
 
 SYSTEM_PROMPT = (
@@ -48,9 +49,10 @@ class LLMScorer:
         batch_size: 批量推理大小
     """
     
-    def __init__(self, model_path, adapter_path, data_dir, device="cuda:0", batch_size=256):
+    def __init__(self, model_path, adapter_path, data_dir, device="cuda:0", batch_size=256, mem_debug=False):
         self.device = device
         self.batch_size = batch_size
+        self.mem_debug = mem_debug
         
         # ===== 加载实体名和关系名（用于三元组→文本转换）=====
         self.entity_names, self.rel_names = self._load_names(data_dir)
@@ -63,6 +65,8 @@ class LLMScorer:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.zero_token_id = self.tokenizer.encode("0", add_special_tokens=False)[0]
+        self.one_token_id = self.tokenizer.encode("1", add_special_tokens=False)[0]
         
         model = AutoModelForCausalLM.from_pretrained(
             model_path, dtype=torch.bfloat16, device_map=device, trust_remote_code=True,
@@ -77,6 +81,7 @@ class LLMScorer:
         model.eval()
         self.model = model
         print("[LLM-Scorer] 模型就绪")
+        log_cuda_mem("llm_scorer.after_model_ready", self.device, self.mem_debug)
     
     def _load_names(self, data_dir):
         """加载实体名和关系名"""
@@ -164,27 +169,26 @@ class LLMScorer:
                                 desc="LLM评分", leave=False):
             batch_prompts = prompts[batch_start:batch_start + self.batch_size]
             batch_valid_idx = valid_indices[batch_start:batch_start + self.batch_size]
+            batch_id = batch_start // self.batch_size
             
             inputs = self.tokenizer(
                 batch_prompts, return_tensors="pt", padding=True,
                 truncation=True, max_length=256,
             ).to(self.device)
+            if self.mem_debug and (batch_id == 0 or (batch_id + 1) % 500 == 0):
+                log_cuda_mem(f"llm_scorer.batch{batch_id}.after_tokenize", self.device, True,
+                             extra=f"batch_size={len(batch_prompts)}")
             
-            outputs = self.model.generate(
-                **inputs, max_new_tokens=8, do_sample=False,
-                temperature=None, top_p=None,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-            
-            input_len = inputs['input_ids'].shape[1]
-            for j, output in enumerate(outputs):
-                text_out = self.tokenizer.decode(output[input_len:], skip_special_tokens=True).strip()
-                try:
-                    val = float(text_out)
-                    val = max(0.0, min(1.0, val))  # 钳位到 [0, 1]
-                except ValueError:
-                    val = 0.5
-                scores[batch_valid_idx[j]] = val
+            outputs = self.model(**inputs, return_dict=True)
+            if self.mem_debug and (batch_id == 0 or (batch_id + 1) % 500 == 0):
+                log_cuda_mem(f"llm_scorer.batch{batch_id}.after_forward", self.device, True)
+            next_token_logits = outputs.logits[:, -1, :]
+            binary_logits = next_token_logits[:, [self.zero_token_id, self.one_token_id]]
+            binary_probs = torch.softmax(binary_logits.float(), dim=-1)
+            one_probs = binary_probs[:, 1].detach().cpu().numpy()
+
+            for j, prob_one in enumerate(one_probs):
+                scores[batch_valid_idx[j]] = float(prob_one)
         
         n_scored = len(valid_indices)
         mean_score = scores[valid_indices].mean() if valid_indices else 0

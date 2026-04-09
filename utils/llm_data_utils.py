@@ -14,6 +14,11 @@ from tqdm import tqdm
 from collections import defaultdict
 
 try:
+    from utils.path_utils import default_dataset_root, resolve_dataset_dir
+except ImportError:
+    from path_utils import default_dataset_root, resolve_dataset_dir
+
+try:
     from utils.relation_templates import REL_TEMPLATES
 except ImportError:
     from relation_templates import REL_TEMPLATES
@@ -421,7 +426,7 @@ def parse_mask(prediction_path, n_triplets, output_mask_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='amazon-book')
-    parser.add_argument('--data_path', default='data/')
+    parser.add_argument('--data_path', default=default_dataset_root())
     parser.add_argument('--output_dir', default=None)
     parser.add_argument('--mode', choices=['train', 'inference', 'parse_mask'], default='train')
     parser.add_argument('--max_samples', type=int, default=25000)
@@ -431,7 +436,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_triplets', type=int, default=None)
     args = parser.parse_args()
 
-    data_dir = os.path.join(args.data_path, args.dataset)
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     if args.output_dir is None:
         args.output_dir = os.path.join(data_dir, 'llm_data')
 

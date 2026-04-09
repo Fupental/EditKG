@@ -20,6 +20,11 @@ import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
 
+try:
+    from utils.path_utils import default_base_model_path, default_dataset_root, resolve_dataset_dir
+except ImportError:
+    from path_utils import default_base_model_path, default_dataset_root, resolve_dataset_dir
+
 SYSTEM_PROMPT = (
     "You are a knowledge graph validation expert. "
     "Given the following statement about a book or literary work, "
@@ -255,9 +260,9 @@ def generate_hard_negatives(pos_triplets, triplet_set, entity_names,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="amazon-book")
-    parser.add_argument("--data_path", default="data/")
+    parser.add_argument("--data_path", default=default_dataset_root())
     parser.add_argument("--model_path",
-                        default="/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B")
+                        default=default_base_model_path())
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--num_pos", type=int, default=NUM_POSITIVE)
     parser.add_argument("--num_neg_simple", type=int, default=NUM_NEG_SIMPLE)
@@ -270,7 +275,7 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    data_dir = os.path.join(args.data_path, args.dataset)
+    data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     out_dir = os.path.join(data_dir, "llm_sft_xujia")
     os.makedirs(out_dir, exist_ok=True)
 
