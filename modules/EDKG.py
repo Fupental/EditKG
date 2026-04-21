@@ -320,13 +320,6 @@ class GraphConv(nn.Module):
         self.device = device            # 计算设备（CPU 或 GPU）
         self.act_func = nn.LeakyReLU()
         
-        # ===== 两个APL实例 =====
-        # 创建两个 SelectAgent（前面定义的3层MLP）
-        # 分别用于 Primary KG 和 Potential KG
-        # 输入维度 = channel * 3 = 384，因为拼接了 [head_emb, rel_emb, tail_emb]
-        self.Select_agent = SelectAgent(channel * 3, 1)    # Primary KG 的APL
-        self.N_Select_agent = SelectAgent(channel * 3, 1)  # Potential KG 的APL
-
         # 交叉熵损失函数（备用）
         # label_smoothing=0.2: 标签平滑，防止模型过于自信
         self.bce_loss = nn.CrossEntropyLoss(label_smoothing=0.2)
@@ -344,11 +337,12 @@ class GraphConv(nn.Module):
         n_relation_weight = nn.init.xavier_uniform_(torch.empty(n_relations, channel))  
         self.n_relation_weight = nn.Parameter(n_relation_weight)  # Potential KG 关系嵌入
         
-        # ===== LLM教师分数缓存（替代KGC教师模型）=====
-        # 每3个epoch Potential KG更新时，由 LLMScorer 预计算所有候选三元组的
-        # 真实性分数 ∈ [0,1]，缓存后在训练时通过 MMD 损失蒸馏到 N_Select_agent(APL)
-        # set_llm_scores() 由 main.py 在生成候选KG后调用
-        self.llm_scores = None  # [N_potential, 1] float tensor，LLM对Potential KG每条边的真实性分数
+        # ===== 双路LLM分数缓存 =====
+        # 重构后不再使用 APL/MMD。
+        # Primary KG 与 Potential KG 的边权重都直接由同一个 LLM 评分给出。
+        self.primary_llm_scores = None     # [N_primary, 1]
+        self.potential_llm_scores = None   # [N_potential, 1]
+        self.llm_score_threshold = 0.5
         
         # ===== 构建多层CF聚合器 =====
         # n_hops=2 时，创建2个 Aggregator（对应2层GNN）
@@ -373,15 +367,27 @@ class GraphConv(nn.Module):
         self.n_edge_index = two_hpo_kg[:, [0, -1]].transpose(1, 0)  # [2, N] 头尾索引
         self.n_edge_type = two_hpo_kg[:, 1]                          # [N] 关系类型
         
-    def set_llm_scores(self, scores_tensor):
+    def set_llm_scores(self, primary_scores_tensor=None, potential_scores_tensor=None):
+        """设置 Primary / Potential KG 的 LLM 真实性分数。"""
+        if primary_scores_tensor is not None:
+            self.primary_llm_scores = primary_scores_tensor
+        if potential_scores_tensor is not None:
+            self.potential_llm_scores = potential_scores_tensor
+
+    def _prepare_llm_masks(self, scores_tensor, num_edges, device):
         """
-        设置LLM预计算的Potential KG三元组真实性分数
-        
-        参数:
-            scores_tensor: [N_potential, 1] float tensor，每条边的真实性分数 ∈ [0, 1]
-                          由 LLMScorer.score_triplets() 返回
+        将 LLM 连续分数转为图传播可直接使用的 soft/hard mask。
+        soft 直接取 LLM 分数，hard 使用固定阈值 0.5。
         """
-        self.llm_scores = scores_tensor
+        if scores_tensor is None:
+            raise RuntimeError("LLM scores are required in LLM-only mode, but got None.")
+        if scores_tensor.shape[0] != num_edges:
+            raise RuntimeError(
+                f"LLM score count mismatch: expected {num_edges}, got {scores_tensor.shape[0]}"
+            )
+        llm_soft = scores_tensor.to(device).float()
+        llm_hard = (llm_soft >= self.llm_score_threshold).float()
+        return llm_soft, llm_hard
 
     def _edge_sampling(self, edge_index, edge_type, rate=0.5):
         """边采样：随机保留 rate 比例的边"""
@@ -742,30 +748,15 @@ class GraphConv(nn.Module):
         # Potential KG的实体嵌入：取后dim列
         n_entity_emb = all_embed[self.n_users:][:, self.channel * 2:]  # [n_entities, dim]
 
-        # 第三步：APL属性筛选 —— 对两个KG分别计算保留/丢弃掩码
-        # Primary KG的APL（任务相关性筛选）
-        KG_drop_soft, KG_drop_hard = self.Dnoise_KG(edge_index, edge_type, entity_emb, self.relation_weight, is_gumble=gumbel)
-        # Potential KG的APL（任务相关性筛选）
-        N_KG_drop_soft, N_KG_drop_hard = self.Dnoise_KG(self.n_edge_index, self.n_edge_type, n_entity_emb, self.n_relation_weight, is_gumble=gumbel, new=True)
-
-        # 第四步：★ 计算MMD损失（LLM教师 → APL学生 知识蒸馏）★
-        # LLM作为教师，预计算了Potential KG每条三元组的真实性分数 ∈ [0,1]
-        # 通过MMD损失让APL（学生）的输出分布向LLM分数分布靠近
-        if self.llm_scores is not None:
-            n_potential = N_KG_drop_soft.shape[0]  # Potential KG的边数
-            # 随机采样8192个三元组索引
-            mmd_batch = torch.randint(low=0, high=n_potential, size=(int(4096 * 2),)).to(N_KG_drop_soft.device)
-            # 学生：APL对这批三元组的软掩码分数（任务相关性）
-            bc_n_kg_drop_soft = N_KG_drop_soft[mmd_batch]  # [8192, 1]
-            # 教师：LLM预计算的真实性分数（查表，不需要在线推理）
-            bc_llm_soft = self.llm_scores[mmd_batch].to(N_KG_drop_soft.device)  # [8192, 1]
-            # .detach() 切断梯度：教师分数只提供目标，不参与反向传播
-            bc_llm_soft = bc_llm_soft.detach()
-            # MMD损失：衡量学生和教师的输出分布差异
-            mmd_loss = self._cal_mmd(bc_llm_soft, bc_n_kg_drop_soft)
-        else:
-            # 未设置LLM分数时（如第0轮Potential KG还没生成），MMD为0
-            mmd_loss = torch.tensor(0.0, device=entity_emb.device)
+        # 第三步：LLM-only 边筛选 —— 两张KG都直接使用 LLM 真实性分数
+        KG_drop_soft, KG_drop_hard = self._prepare_llm_masks(
+            self.primary_llm_scores, edge_index.shape[1], entity_emb.device
+        )
+        if self.n_edge_index is None or self.n_edge_type is None:
+            raise RuntimeError("Potential KG has not been initialized before GraphConv.forward.")
+        N_KG_drop_soft, N_KG_drop_hard = self._prepare_llm_masks(
+            self.potential_llm_scores, self.n_edge_index.shape[1], n_entity_emb.device
+        )
         
         # 第五步：多层KG消息传递（带残差连接）
         # 【什么是残差连接？】
@@ -799,8 +790,7 @@ class GraphConv(nn.Module):
             item_embed_res = item_embed_res + F.normalize(item_embeds)   # 物品嵌入残差累加
             user_embed_res = user_embed_res + F.normalize(user_embeds)   # 用户嵌入残差累加
         
-        bce_loss = 0
-        return user_embed_res, item_embed_res, KG_drop_hard, mmd_loss
+        return user_embed_res, item_embed_res, KG_drop_hard
 
 
 
@@ -833,7 +823,7 @@ class Recommender(nn.Module):
         v_feat: 视觉特征 numpy 数组 [n_items, v_dim]（可选）
         t_feat: 文本特征 numpy 数组 [n_items, t_dim]（可选）
     """
-    def __init__(self, data_config, args_config, graph, ui_sp_graph, item_rel_mask, v_feat=None, t_feat=None):
+    def __init__(self, data_config, args_config, graph, ui_sp_graph, item_rel_mask, triplets=None, v_feat=None, t_feat=None):
         super(Recommender, self).__init__()
 
         self.n_users = data_config['n_users']
@@ -869,8 +859,8 @@ class Recommender(nn.Module):
         self.item_rel_mask = torch.FloatTensor(item_rel_mask).to(self.device)
         self.ui_sp_graph = ui_sp_graph
 
-        # 从 NetworkX 图中提取边索引和类型，转为GPU张量
-        self.edge_index, self.edge_type = self._get_edges(graph)
+        # Primary KG 使用原始 triplets 的顺序，保证和 LLM 打分结果严格对齐。
+        self.edge_index, self.edge_type = self._get_edges(graph, triplets)
         
         # Potential KG 的边（初始为None，训练中动态更新）
         self.n_edge_index = None
@@ -967,11 +957,16 @@ class Recommender(nn.Module):
                          node_dropout_rate=self.node_dropout_rate,
                          mess_dropout_rate=self.mess_dropout_rate)
 
-    def _get_edges(self, graph):
-        """从 NetworkX 图中提取边索引和类型，转为GPU张量"""
-        graph_tensor = torch.tensor(list(graph.edges))  
-        index = graph_tensor[:, :-1]  # [head, tail]
-        type = graph_tensor[:, -1]    # relation
+    def _get_edges(self, graph, triplets=None):
+        """提取 Primary KG 边索引和类型，优先使用 triplets 保持顺序稳定。"""
+        if triplets is not None:
+            graph_tensor = torch.as_tensor(triplets, dtype=torch.long)
+            index = graph_tensor[:, [0, 2]]
+            type = graph_tensor[:, 1]
+        else:
+            graph_tensor = torch.tensor(list(graph.edges))
+            index = graph_tensor[:, :-1]
+            type = graph_tensor[:, -1]
         return index.t().long().to(self.device), type.long().to(self.device)
 
 
@@ -1078,7 +1073,7 @@ class Recommender(nn.Module):
         
         返回:
             cet_loss: 交叉熵损失（将推荐视为多分类问题）
-            mmd_loss: MMD蒸馏损失（LLM教师→APL学生）
+            推荐损失
         
         流程:
             1. 调用 GraphConv 获取用户和物品嵌入
@@ -1087,7 +1082,7 @@ class Recommender(nn.Module):
             4. 使用交叉熵损失（每个用户的正样本物品作为正确类别）
         """
         # GCN前向传播，获取聚合后的嵌入
-        user_all_emb, item_all_emb, KG_drop_hard, mmd_loss = self.gcn(self.all_embed,
+        user_all_emb, item_all_emb, KG_drop_hard = self.gcn(self.all_embed,
                                                             self.all_embed_cf,
                                                             self.edge_index,
                                                             self.edge_type,
@@ -1120,7 +1115,7 @@ class Recommender(nn.Module):
         regularizer = (torch.norm(user_emb) ** 2
                        + torch.norm(pos_emb) ** 2)
  
-        return cet_loss, mmd_loss 
+        return cet_loss 
     
 
 
@@ -1133,14 +1128,13 @@ class Recommender(nn.Module):
             mode: "cf" 表示推荐训练，其他表示KGC训练
         
         返回:
-            (cet_loss, mmd_loss) 推荐损失和MMD蒸馏损失
+            cet_loss 推荐损失
         """
         if True:  # 仅CF推荐模式（KGC模式已删除）
             user = batch['users']       # 批次用户ID
             pos_item = batch['pos_items']  # 批次正样本物品ID
 
-            loss_network = self.gcn_forword(user, pos_item)
-            return loss_network
+            return self.gcn_forword(user, pos_item)
         
         # [已删除] KGC训练模式 → LLM训练独立进行（MS-Swift）
 
@@ -1158,7 +1152,7 @@ class Recommender(nn.Module):
             for_kgc=False: (item_emb, user_emb) 用于推荐评分
             for_kgc=True: (item_emb, KG_drop_hard) 用于KGC分析
         """
-        user_all_emb, item_all_emb, KG_drop_hard, kg_loss = self.gcn(self.all_embed,
+        user_all_emb, item_all_emb, KG_drop_hard = self.gcn(self.all_embed,
                                                             self.all_embed_cf,
                                                             self.edge_index,
                                                             self.edge_type,

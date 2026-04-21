@@ -2,6 +2,12 @@ import os
 from pathlib import Path
 
 
+MODELSCOPE_CACHE_ROOT = Path(
+    os.environ.get("MODELSCOPE_CACHE", "/root/autodl-tmp/data/models/modelscope")
+).expanduser()
+QWEN3_MODEL_RELATIVE_PATH = Path("hub") / "models" / "Qwen" / "Qwen3-4B-Instruct-2507"
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -11,11 +17,17 @@ def project_root() -> Path:
 
 
 def datasets_root() -> Path:
-    return project_root() / "data" / "datasets"
+    local_path = project_root() / "data" / "datasets"
+    if local_path.exists():
+        return local_path
+    return Path("/root/autodl-tmp/data/datasets")
 
 
 def models_root() -> Path:
-    return project_root() / "data" / "models"
+    local_path = project_root() / "data" / "models"
+    if local_path.exists():
+        return local_path
+    return Path("/root/autodl-tmp/data/models")
 
 
 def default_dataset_root() -> str:
@@ -27,7 +39,7 @@ def default_adapter_path() -> str:
 
 
 def default_base_model_path() -> str:
-    return str(Path("/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507"))
+    return str(MODELSCOPE_CACHE_ROOT / QWEN3_MODEL_RELATIVE_PATH)
 
 
 def resolve_data_path(data_path: str) -> str:

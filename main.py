@@ -34,7 +34,7 @@ import scipy.sparse as sp
 from collections import Counter, defaultdict
 
 from utils.parser import parse_args
-from utils.path_utils import ensure_dir, resolve_dataset_dir
+from utils.path_utils import ensure_dir, resolve_dataset_dir, models_root
 from utils.memory_monitor import log_cuda_mem, MemTimer
 from prettytable import PrettyTable
 # [已删除] accuracy_score — KGC验证不再需要
@@ -107,6 +107,56 @@ def _process_kg_attr(canditate_kg, tripltes, kg_mask=None):
     else:
         all_candi_kg = canditate_kg
     return np.unique(all_candi_kg, axis=0)
+
+
+def precompute_llm_scores_subprocess(triplets_tensor, tag, llm_score_dir, data_dir, args, llm_score_cache_path):
+    triplets_path = os.path.join(llm_score_dir, f"{tag}_triplets.pt")
+    scores_path = os.path.join(llm_score_dir, f"{tag}_scores.pt")
+    torch.save(triplets_tensor.detach().cpu(), triplets_path)
+    print(f"[LLM] {tag} 三元组已保存: {triplets_path}")
+    cmd = [
+        sys.executable,
+        os.path.join(os.path.dirname(__file__), "utils", "precompute_llm_scores.py"),
+        "--triplets_path", triplets_path,
+        "--output_path", scores_path,
+        "--data_dir", data_dir,
+        "--model_path", args.llm_model_path,
+        "--adapter_path", args.llm_adapter_path,
+        "--cache_path", llm_score_cache_path,
+        "--batch_size", str(args.llm_batch_size),
+        "--gpu_id", str(args.gpu_id),
+    ]
+    if args.mem_debug:
+        cmd.append("--mem_debug")
+    print(f"[LLM] 启动独立进程打分({tag}): {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    return torch.load(scores_path, map_location=device)
+
+
+def extract_active_primary_triplets(triplets, n_items, context_hops):
+    """
+    仅保留在当前 message passing 深度内可能影响 item embedding 的 Primary KG 边。
+    对本模型的消息方向，保留：
+    - 第1层：head 是 item 的边
+    - 第2层及以后：head 是上一层 tail 实体的边
+    """
+    active_heads = set(range(int(n_items)))
+    kept_masks = []
+    heads = triplets[:, 0]
+    tails = triplets[:, 2]
+    for _ in range(int(context_hops)):
+        head_list = np.fromiter(active_heads, dtype=np.int64)
+        if head_list.size == 0:
+            break
+        mask = np.isin(heads, head_list)
+        kept_masks.append(mask)
+        active_heads = set(tails[mask].tolist())
+    if not kept_masks:
+        return triplets
+    final_mask = kept_masks[0].copy()
+    for mask in kept_masks[1:]:
+        final_mask |= mask
+    return triplets[final_mask]
     
 
 
@@ -118,6 +168,11 @@ if __name__ == '__main__':
     # ===== 1. 读取命令行参数 =====
     global args, device, train_user_set, kg_dict, item_lists_dict, ent_lists_dict
     args = parse_args()
+    if args.llm_adapter_path and not os.path.exists(args.llm_adapter_path):
+        alt_adapter = os.path.join(str(models_root()), os.path.basename(args.llm_adapter_path))
+        if os.path.exists(alt_adapter):
+            print(f"[PATH] llm_adapter_path 不存在，自动回退到: {alt_adapter}")
+            args.llm_adapter_path = alt_adapter
     device = torch.device("cuda:" + str(args.gpu_id)) if args.cuda else torch.device("cpu")
     data_dir = resolve_dataset_dir(args.data_path, args.dataset)
     llm_score_dir = args.llm_score_dir or os.path.join(data_dir, "llm_scores")
@@ -148,6 +203,11 @@ if __name__ == '__main__':
     # kg_dict: {head: [(tail, relation), ...]} 邻接字典
     train_cf, test_cf, user_dict, n_params, graph, ui_sparse_graph, all_sparse_graph, item_rel_mask, triplets, kg_dict, v_feat, t_feat = load_data(args)
     log_cuda_mem("after.load_data", device, args.mem_debug)
+    primary_triplets = extract_active_primary_triplets(triplets, n_params['n_items'], args.context_hops)
+    if args.quick_test and len(primary_triplets) > 20000:
+        primary_triplets = primary_triplets[:20000]
+        print(f"[QUICK TEST] Primary KG 活跃子图裁切到 {len(primary_triplets)} 条边")
+    print(f"[Primary KG] 原始边数={len(triplets)}, 活跃子图边数={len(primary_triplets)}, context_hops={args.context_hops}")
 
     # 如果指定 --no_mm，禁用多模态特征（作为基线对照）
     if args.no_mm:
@@ -174,11 +234,16 @@ if __name__ == '__main__':
     train_cf_pairs = (np.array([[cf[0], cf[1]] for cf in train_cf], np.int32))#其实 train_cf 本身已经是 [N, 2] 格式了，这行代码主要作用就是确保数据类型是 int32 的 numpy 数组，方便后续做索引和打乱操作。
 
     # ===== 5. 创建模型 =====
-    model = Recommender(n_params, args, graph, ui_sparse_graph, item_rel_mask, v_feat=v_feat, t_feat=t_feat).to(device)
+    model = Recommender(
+        n_params, args, graph, ui_sparse_graph, item_rel_mask, triplets=primary_triplets, v_feat=v_feat, t_feat=t_feat
+    ).to(device)
     log_cuda_mem("after.model_init", device, args.mem_debug)
 
     # ===== 5.5 初始化LLM评分器（替代KGC教师）=====
     llm_scorer = None
+    if not args.llm_model_path:
+        raise ValueError("当前代码已重构为 LLM-only KG 筛边，必须提供 --llm_model_path")
+
     if args.llm_model_path and args.llm_score_mode == "online":
         from modules.llm_scorer import LLMScorer
         llm_scorer = LLMScorer(
@@ -189,11 +254,22 @@ if __name__ == '__main__':
             batch_size=args.llm_batch_size,
             mem_debug=args.mem_debug,
         )
-        print(f"[LLM] LLM评分器已就绪")
+        print(f"[LLM] LLM评分器已就绪（LLM-only 模式）")
     elif args.llm_model_path and args.llm_score_mode == "subprocess":
-        print("[LLM] 使用 subprocess 模式：每3轮启动独立进程打分，不在训练进程常驻LLM")
+        print("[LLM] 使用 subprocess 模式：Primary KG 预打分一次，Potential KG 每3轮独立进程打分")
+
+    # ===== 5.6 预计算 Primary KG 的 LLM 真实性分数 =====
+    primary_triplets = torch.LongTensor(primary_triplets).to(device)
+    if args.llm_score_mode == "subprocess":
+        with MemTimer("primary_kg.llm_subprocess", device, args.mem_debug):
+            primary_scores = precompute_llm_scores_subprocess(
+                primary_triplets, "primary_kg", llm_score_dir, data_dir, args, llm_score_cache_path
+            )
     else:
-        print("[LLM] 未指定--llm_model_path，跳过LLM教师蒸馏（mmd_loss=0）")
+        with MemTimer("primary_kg.llm_online", device, args.mem_debug):
+            primary_scores = llm_scorer.score_triplets(primary_triplets, target_device=device)
+    model.gcn.set_llm_scores(primary_scores_tensor=primary_scores)
+    print(f"[LLM] Primary KG 打分完成, shape={primary_scores.shape}, 均值={primary_scores.float().mean():.3f}")
 
     # ===== 6. 创建优化器 =====
     # 主优化器：Adam
@@ -247,6 +323,9 @@ if __name__ == '__main__':
             
             # Step 2: 扩展候选KG（加入候选尾实体的属性三元组）
             all_candi_kg = _process_kg_attr(candi_kg, triplets)
+            if args.quick_test and len(all_candi_kg) > 20000:
+                all_candi_kg = all_candi_kg[:20000]
+                print(f"[QUICK TEST] Potential KG 裁切到 {len(all_candi_kg)} 条边")
             
             # [已删除] KGC训练步骤 → LLM训练独立进行（MS-Swift）
             
@@ -256,32 +335,13 @@ if __name__ == '__main__':
             log_cuda_mem(f"epoch{epoch}.kg_refresh.after_update", device, args.mem_debug,
                          extra=f"candidates={len(all_candi_kg)}")
             
-            # Step 5: ★ LLM教师预计算 Potential KG 所有三元组的真实性分数 ★
-            # 替代原来的KGC在线训练+推理，LLM只需推理一次，结果缓存供后续每batch查表
+            # Step 5: 预计算 Potential KG 所有三元组的 LLM 真实性分数
             if args.llm_model_path and args.llm_score_mode == "subprocess":
-                triplets_path = os.path.join(llm_score_dir, f"candidate_triplets_epoch_{epoch:03d}.pt")
-                scores_path = os.path.join(llm_score_dir, f"llm_scores_epoch_{epoch:03d}.pt")
-                torch.save(all_candi_kg.detach().cpu(), triplets_path)
-                print(f"[LLM] 候选KG已保存: {triplets_path}")
-                cmd = [
-                    sys.executable,
-                    os.path.join(os.path.dirname(__file__), "utils", "precompute_llm_scores.py"),
-                    "--triplets_path", triplets_path,
-                    "--output_path", scores_path,
-                    "--data_dir", data_dir,
-                    "--model_path", args.llm_model_path,
-                    "--adapter_path", args.llm_adapter_path,
-                    "--cache_path", llm_score_cache_path,
-                    "--batch_size", str(args.llm_batch_size),
-                    "--gpu_id", str(args.gpu_id),
-                ]
-                if args.mem_debug:
-                    cmd.append("--mem_debug")
-                print(f"[LLM] 启动独立进程打分: {' '.join(cmd)}")
                 with MemTimer(f"epoch{epoch}.llm_subprocess", device, args.mem_debug):
-                    subprocess.run(cmd, check=True)
-                llm_scores = torch.load(scores_path, map_location=device)
-                model.gcn.set_llm_scores(llm_scores)
+                    llm_scores = precompute_llm_scores_subprocess(
+                        all_candi_kg, f"candidate_epoch_{epoch:03d}", llm_score_dir, data_dir, args, llm_score_cache_path
+                    )
+                model.gcn.set_llm_scores(potential_scores_tensor=llm_scores)
                 print(f"[LLM] subprocess 打分完成, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
                 log_cuda_mem(f"epoch{epoch}.llm_scores_loaded", device, args.mem_debug,
                              extra=f"shape={tuple(llm_scores.shape)}")
@@ -289,7 +349,7 @@ if __name__ == '__main__':
                 print(f"[LLM] 对 {len(all_candi_kg)} 条候选三元组进行真实性评分...")
                 with MemTimer(f"epoch{epoch}.llm_online", device, args.mem_debug):
                     llm_scores = llm_scorer.score_triplets(all_candi_kg, target_device=device)
-                model.gcn.set_llm_scores(llm_scores)
+                model.gcn.set_llm_scores(potential_scores_tensor=llm_scores)
                 print(f"[LLM] 分数已缓存, shape={llm_scores.shape}, 均值={llm_scores.mean():.3f}")
                 log_cuda_mem(f"epoch{epoch}.llm_scores_cached", device, args.mem_debug,
                              extra=f"shape={tuple(llm_scores.shape)}")
@@ -309,18 +369,16 @@ if __name__ == '__main__':
             batch['users'] = all_feed_data['users'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
             batch['pos_items'] = all_feed_data['pos_items'][i * args.batch_size:(i + 1) * args.batch_size].to(device)
 
-            # 前向传播：返回 (推荐损失, MMD蒸馏损失)
+            # 前向传播：返回推荐损失
             if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
                 log_cuda_mem(f"epoch{epoch}.batch{i}.before_forward", device, True)
-            cet_loss, mmd_loss = model(batch)
-            
-            # 总损失 = 推荐损失 + MMD蒸馏损失（LLM教师→APL学生）
-            batch_loss = cet_loss + mmd_loss
+            cet_loss = model(batch)
+            batch_loss = cet_loss
             
             optimizer.zero_grad()
             if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
                 log_cuda_mem(f"epoch{epoch}.batch{i}.after_forward", device, True,
-                             extra=f"cet={cet_loss.item():.4f},mmd={mmd_loss.item():.4f}")
+                             extra=f"cet={cet_loss.item():.4f}")
             batch_loss.backward()
             if args.mem_debug and (i == 0 or (i + 1) % args.mem_debug_interval == 0):
                 log_cuda_mem(f"epoch{epoch}.batch{i}.after_backward", device, True)

@@ -14,7 +14,7 @@
 - 数据集目录：`/root/autodl-tmp/projects/EditKG/data/datasets/amazon-book`
 - LoRA 权重目录：`/root/autodl-tmp/projects/EditKG/data/models/checkpoint-37736`
 - Qwen3-4B-Instruct-2507 本地目录：
-  `/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507`
+  `/root/autodl-tmp/data/models/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507`
 
 ## 2. 路径与工程兼容性修改
 
@@ -298,7 +298,7 @@ python main.py \
   --test_batch_size 2048 \
   --gpu_id 0 \
   --seed 2023 \
-  --llm_model_path /root/.cache/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507 \
+  --llm_model_path /root/autodl-tmp/data/models/modelscope/hub/models/Qwen/Qwen3-4B-Instruct-2507 \
   --llm_adapter_path /root/autodl-tmp/projects/EditKG/data/models/checkpoint-37736 \
   --llm_score_mode subprocess
 ```
